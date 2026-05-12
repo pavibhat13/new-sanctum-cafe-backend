@@ -12,6 +12,7 @@ const MasterValue = require('../models/MasterValue');
 const ChecklistLog = require('../models/ChecklistLog');
 const ManagementInventory = require('../models/ManagementInventory');
 const Config = require('../models/Config');
+const StaffLeave = require('../models/StaffLeave');
 const { authenticateToken, requireOwner } = require('../middleware/auth');
 
 router.use(authenticateToken);
@@ -260,18 +261,28 @@ router.post('/expenses', async (req, res) => {
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
 
-router.put('/expenses/:id', requireOwner, async (req, res) => {
+router.put('/expenses/:id', async (req, res) => {
   try {
-    const expense = await Expense.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    const expense = await Expense.findById(req.params.id);
     if (!expense) return res.status(404).json({ message: 'Not found' });
-    res.json(expense);
+    // Staff can only edit expenses they created
+    if (req.user.role === 'staff' && expense.createdBy !== 'staff') {
+      return res.status(403).json({ message: 'Not authorised to edit this expense' });
+    }
+    Object.assign(expense, req.body);
+    res.json(await expense.save());
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
 
-router.delete('/expenses/:id', requireOwner, async (req, res) => {
+router.delete('/expenses/:id', async (req, res) => {
   try {
-    const expense = await Expense.findByIdAndDelete(req.params.id);
+    const expense = await Expense.findById(req.params.id);
     if (!expense) return res.status(404).json({ message: 'Not found' });
+    // Staff can only delete expenses they created
+    if (req.user.role === 'staff' && expense.createdBy !== 'staff') {
+      return res.status(403).json({ message: 'Not authorised to delete this expense' });
+    }
+    await expense.deleteOne();
     res.json({ message: 'Deleted' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -394,11 +405,10 @@ router.post('/inventory', async (req, res) => {
     let inv = await ManagementInventory.findOne({ item: { $regex: new RegExp(`^${item.trim()}$`, 'i') } });
     if (inv) {
       if (req.user.role === 'staff') {
-        // Staff can only update usedQty
-        if (usedQty !== undefined) {
-          inv.usedQty = usedQty;
-          inv.closingStock = (inv.openingStock || 0) + (inv.purchasedQty || 0) - inv.usedQty;
-        }
+        // Staff can only update quantities (openingStock and usedQty); metadata is owner-only
+        if (openingStock !== undefined) inv.openingStock = openingStock;
+        if (usedQty !== undefined) inv.usedQty = usedQty;
+        inv.closingStock = (inv.openingStock || 0) + (inv.purchasedQty || 0) - (inv.usedQty || 0);
       } else {
         if (category) inv.category = category;
         if (unit) inv.unit = unit;
@@ -534,6 +544,94 @@ router.get('/reports/purchase-summary', requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
+// ── Inventory Snapshot Report ─────────────────────────────────────────────────
+
+router.get('/reports/inventory-snapshot', requireOwner, async (req, res) => {
+  try {
+    const items = await ManagementInventory.find().sort({ category: 1, item: 1 });
+    res.json(items.map(i => ({
+      _id: i._id,
+      item: i.item,
+      category: i.category,
+      unit: i.unit,
+      openingStock: i.openingStock,
+      purchasedQty: i.purchasedQty,
+      usedQty: i.usedQty,
+      closingStock: i.closingStock,
+      threshold: i.threshold,
+      status: i.threshold > 0 && i.closingStock <= i.threshold ? 'Low' : 'OK',
+    })));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── Inventory Movement Report ─────────────────────────────────────────────────
+
+router.get('/reports/inventory-movement', requireOwner, async (req, res) => {
+  try {
+    const { fromDate, toDate } = req.query;
+    if (!fromDate || !toDate) return res.status(400).json({ message: 'fromDate and toDate required' });
+    const start = new Date(fromDate); start.setHours(0, 0, 0, 0);
+    const end = new Date(toDate); end.setHours(23, 59, 59, 999);
+
+    const lines = await PurchaseLine.aggregate([
+      { $lookup: { from: 'purchaseheaders', localField: 'purchaseHeader', foreignField: '_id', as: 'header' } },
+      { $unwind: '$header' },
+      { $match: { 'header.date': { $gte: start, $lte: end } } },
+      { $group: {
+        _id: '$item',
+        timesOrdered: { $sum: 1 },
+        totalQtyPurchased: { $sum: '$quantity' },
+        totalSpend: { $sum: '$rate' },
+      }},
+      { $sort: { timesOrdered: -1 } },
+    ]);
+
+    const inventory = await ManagementInventory.find({});
+    const invMap = {};
+    inventory.forEach(i => { invMap[normalizeItemName(i.item)] = i.usedQty || 0; });
+
+    const total = lines.length;
+    const fastCut = Math.ceil(total / 3);
+    const slowCut = total - Math.floor(total / 3);
+
+    const data = lines.map((l, i) => ({
+      item: l._id,
+      timesOrdered: l.timesOrdered,
+      totalQtyPurchased: Number(l.totalQtyPurchased.toFixed(2)),
+      totalSpend: Number(l.totalSpend.toFixed(2)),
+      usedQty: invMap[normalizeItemName(l._id)] || 0,
+      movement: total < 3 ? 'Normal' : i < fastCut ? 'Fast' : i >= slowCut ? 'Slow' : 'Normal',
+    }));
+
+    res.json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── Vendor Frequency Report ───────────────────────────────────────────────────
+
+router.get('/reports/vendor-frequency', requireOwner, async (req, res) => {
+  try {
+    const { fromDate, toDate } = req.query;
+    if (!fromDate || !toDate) return res.status(400).json({ message: 'fromDate and toDate required' });
+    const start = new Date(fromDate); start.setHours(0, 0, 0, 0);
+    const end = new Date(toDate); end.setHours(23, 59, 59, 999);
+
+    const data = await PurchaseHeader.aggregate([
+      { $match: { date: { $gte: start, $lte: end } } },
+      { $group: {
+        _id: '$vendor',
+        invoiceCount: { $sum: 1 },
+        totalAmount: { $sum: '$totalAmount' },
+        lastInvoiceDate: { $max: '$date' },
+      }},
+      { $sort: { invoiceCount: -1 } },
+      { $project: { vendor: '$_id', invoiceCount: 1, totalAmount: 1, lastInvoiceDate: 1, _id: 0 } },
+    ]);
+
+    res.json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
 // ── Config / Settings ─────────────────────────────────────────────────────────
 
 router.get('/config', requireOwner, async (req, res) => {
@@ -625,6 +723,75 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         res.setHeader('Content-Disposition', `attachment; filename=purchase-summary-${new Date().toISOString().split('T')[0]}.xlsx`);
+        await wb.xlsx.write(res);
+        return res.end();
+      }
+      case 'vendor-frequency': {
+        const svf = fromDate ? new Date(fromDate) : new Date(0); svf.setHours(0, 0, 0, 0);
+        const evf = toDate ? new Date(toDate) : new Date(); evf.setHours(23, 59, 59, 999);
+        const vfData = await PurchaseHeader.aggregate([
+          { $match: { date: { $gte: svf, $lte: evf } } },
+          { $group: { _id: '$vendor', invoiceCount: { $sum: 1 }, totalAmount: { $sum: '$totalAmount' }, lastInvoiceDate: { $max: '$date' } } },
+          { $sort: { invoiceCount: -1 } },
+          { $project: { vendor: '$_id', invoiceCount: 1, totalAmount: 1, lastInvoiceDate: 1, _id: 0 } },
+        ]);
+        const vfRows = vfData.map(r => ({
+          vendor: r.vendor,
+          invoiceCount: r.invoiceCount,
+          totalAmount: r.totalAmount,
+          lastInvoiceDate: new Date(r.lastInvoiceDate).toLocaleDateString('en-IN'),
+        }));
+        ws.columns = [
+          { header: 'Vendor', key: 'vendor', width: 30 },
+          { header: 'Invoice Count', key: 'invoiceCount', width: 15 },
+          { header: 'Total Amount (₹)', key: 'totalAmount', width: 20 },
+          { header: 'Last Invoice Date', key: 'lastInvoiceDate', width: 20 },
+        ];
+        vfRows.forEach(row => ws.addRow(row));
+        ws.getRow(1).font = { bold: true };
+        ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=vendor-frequency-${new Date().toISOString().split('T')[0]}.xlsx`);
+        await wb.xlsx.write(res);
+        return res.end();
+      }
+      case 'inventory-movement': {
+        const sim = fromDate ? new Date(fromDate) : new Date(0); sim.setHours(0, 0, 0, 0);
+        const eim = toDate ? new Date(toDate) : new Date(); eim.setHours(23, 59, 59, 999);
+        const imLines = await PurchaseLine.aggregate([
+          { $lookup: { from: 'purchaseheaders', localField: 'purchaseHeader', foreignField: '_id', as: 'header' } },
+          { $unwind: '$header' },
+          { $match: { 'header.date': { $gte: sim, $lte: eim } } },
+          { $group: { _id: '$item', timesOrdered: { $sum: 1 }, totalQtyPurchased: { $sum: '$quantity' }, totalSpend: { $sum: '$rate' } } },
+          { $sort: { timesOrdered: -1 } },
+        ]);
+        const imInventory = await ManagementInventory.find({});
+        const imMap = {};
+        imInventory.forEach(i => { imMap[normalizeItemName(i.item)] = i.usedQty || 0; });
+        const imTotal = imLines.length;
+        const imFastCut = Math.ceil(imTotal / 3);
+        const imSlowCut = imTotal - Math.floor(imTotal / 3);
+        const imRows = imLines.map((l, i) => ({
+          item: l._id,
+          timesOrdered: l.timesOrdered,
+          totalQtyPurchased: Number(l.totalQtyPurchased.toFixed(2)),
+          totalSpend: Number(l.totalSpend.toFixed(2)),
+          usedQty: imMap[normalizeItemName(l._id)] || 0,
+          movement: imTotal < 3 ? 'Normal' : i < imFastCut ? 'Fast' : i >= imSlowCut ? 'Slow' : 'Normal',
+        }));
+        ws.columns = [
+          { header: 'Item', key: 'item', width: 30 },
+          { header: 'Times Ordered', key: 'timesOrdered', width: 15 },
+          { header: 'Total Qty Purchased', key: 'totalQtyPurchased', width: 20 },
+          { header: 'Total Spend (₹)', key: 'totalSpend', width: 15 },
+          { header: 'Used Qty', key: 'usedQty', width: 12 },
+          { header: 'Movement', key: 'movement', width: 12 },
+        ];
+        imRows.forEach(row => ws.addRow(row));
+        ws.getRow(1).font = { bold: true };
+        ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=inventory-movement-${new Date().toISOString().split('T')[0]}.xlsx`);
         await wb.xlsx.write(res);
         return res.end();
       }
@@ -759,6 +926,34 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
     if (toAdd.length) await ManagementInventory.insertMany(toAdd);
     res.json({ success: true, message: `${toAdd.length} added, ${skipped.length} skipped`, addedCount: toAdd.length, skippedCount: skipped.length });
   } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
+});
+
+// ── Staff Leaves ──────────────────────────────────────────────────────────────
+
+router.get('/staff-leaves', async (req, res) => {
+  try {
+    const { fromDate, toDate, employeeName } = req.query;
+    const query = {};
+    const dq = getDateRangeQuery(fromDate, toDate);
+    if (dq) query.date = dq;
+    if (employeeName) query.employeeName = new RegExp(employeeName.trim(), 'i');
+    res.json(await StaffLeave.find(query).sort({ date: -1 }));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/staff-leaves', requireOwner, async (req, res) => {
+  try {
+    const { employeeName, date, leaveType, notes } = req.body;
+    const leave = await new StaffLeave({ employeeName, date, leaveType, notes, createdBy: req.user.role }).save();
+    res.status(201).json(leave);
+  } catch (e) { res.status(400).json({ message: e.message }); }
+});
+
+router.delete('/staff-leaves/:id', requireOwner, async (req, res) => {
+  try {
+    await StaffLeave.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Deleted' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 module.exports = router;
