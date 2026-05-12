@@ -657,9 +657,78 @@ router.put('/config', requireOwner, async (req, res) => {
 
 // ── Excel Export ──────────────────────────────────────────────────────────────
 
+router.get('/download-template', requireOwner, async (req, res) => {
+  try {
+    const { type } = req.query;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Template');
+
+    const headerFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD4A017' } };
+    const headerFont = { bold: true, color: { argb: 'FF1A1815' }, size: 11 };
+    const noteFill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEEEEEE' } };
+    const noteFont  = { italic: true, color: { argb: 'FF888888' }, size: 9 };
+
+    if (type === 'invoice') {
+      ws.columns = [
+        { header: 'Item', key: 'item', width: 30 },
+        { header: 'Qty', key: 'qty', width: 12 },
+        { header: 'Total Amount (₹)', key: 'total', width: 20 },
+      ];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      const samples = [['Onion', 5.5, 100], ['Tomato', 3, 60], ['Mozzarella Cheese', 2, 500]];
+      samples.forEach(r => ws.addRow(r));
+      const noteRow = ws.addRow(['← Item name (text)', '← Quantity', '← Total cost for this line (not unit price). Grand total must match bill amount.']);
+      noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
+    } else if (type === 'inventory-master') {
+      ws.columns = [
+        { header: 'Item Name', key: 'item', width: 30 },
+        { header: 'Category', key: 'category', width: 25 },
+        { header: 'Unit', key: 'unit', width: 12 },
+        { header: 'Low Stock Threshold', key: 'threshold', width: 22 },
+      ];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      [
+        ['Mozzarella Cheese', 'Food Raw Material', 'Pkt', 5],
+        ['Onion', 'Vegetables', 'Kg', 2],
+        ['Maida', 'Flour/Other', 'Bag', 1],
+        ['Pizza Box 7"', 'Packaging', 'Pkt', 10],
+      ].forEach(r => ws.addRow(r));
+      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Pkt, Kg, Bag, Ltr…', '← Alert when closing stock ≤ this']);
+      noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
+    } else if (type === 'inventory-stock') {
+      ws.columns = [
+        { header: 'Item Name', key: 'item', width: 30 },
+        { header: 'Category', key: 'category', width: 25 },
+        { header: 'Unit', key: 'unit', width: 12 },
+        { header: 'Opening Stock', key: 'openingStock', width: 16 },
+        { header: 'Used Qty', key: 'usedQty', width: 14 },
+        { header: 'Low Stock Threshold', key: 'threshold', width: 22 },
+      ];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      [
+        ['Mozzarella Cheese', 'Food Raw Material', 'Pkt', 10, 3, 5],
+        ['Onion', 'Vegetables', 'Kg', 5, 2, 2],
+        ['Maida', 'Flour/Other', 'Bag', 2, 1, 1],
+        ['Pizza Box 7"', 'Packaging', 'Pkt', 50, 20, 10],
+      ].forEach(r => ws.addRow(r));
+      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Pkt, Kg, Bag, Ltr…', '← Stock at start of period', '← How much was used', '← Alert threshold']);
+      noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+    } else {
+      return res.status(400).json({ message: 'Unknown template type' });
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${type}-template.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
 router.get('/export-excel', requireOwner, async (req, res) => {
   try {
-    const { type, fromDate, toDate, vendor, platform } = req.query;
+    const { type, fromDate, toDate, vendor, platform, billNo } = req.query;
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet(type || 'Export');
     const query = {};
@@ -667,7 +736,7 @@ router.get('/export-excel', requireOwner, async (req, res) => {
     if (fromDate && toDate) {
       const s = new Date(fromDate); const e = new Date(toDate); e.setHours(23, 59, 59, 999);
       if (type === 'online-settlements') query.paymentDate = { $gte: s, $lte: e };
-      else if (type !== 'inventory') query.date = { $gte: s, $lte: e };
+      else if (type !== 'inventory' && type !== 'purchase-lines') query.date = { $gte: s, $lte: e };
     }
     if (vendor && type === 'purchase-headers') query.vendor = vendor;
     if (platform && type === 'online-settlements') query.platform = platform;
@@ -695,10 +764,21 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         data = await Salary.find(query).sort({ date: -1 });
         columns = [{ header: 'Date', key: 'date', width: 15 }, { header: 'Employee', key: 'employeeName', width: 20 }, { header: 'Amount', key: 'amount', width: 12 }, { header: 'Type', key: 'type', width: 15 }, { header: 'Payment Method', key: 'paymentMethod', width: 15 }, { header: 'Notes', key: 'notes', width: 30 }];
         break;
-      case 'purchase-lines':
-        data = await PurchaseLine.find(query).populate('purchaseHeader', 'billNo vendor date').sort({ createdAt: -1 });
+      case 'purchase-lines': {
+        const headerQuery = {};
+        if (fromDate && toDate) {
+          const s = new Date(fromDate); const e = new Date(toDate); e.setHours(23, 59, 59, 999);
+          headerQuery.date = { $gte: s, $lte: e };
+        }
+        if (billNo) headerQuery.billNo = { $regex: billNo, $options: 'i' };
+        const matchingHeaders = await PurchaseHeader.find(headerQuery).select('_id');
+        const lineQuery = matchingHeaders.length > 0 || fromDate || billNo
+          ? { purchaseHeader: { $in: matchingHeaders.map(h => h._id) } }
+          : {};
+        data = await PurchaseLine.find(lineQuery).populate('purchaseHeader', 'billNo vendor date').sort({ createdAt: -1 });
         columns = [{ header: 'Date', key: 'headerDate', width: 15 }, { header: 'Bill No', key: 'billNo', width: 15 }, { header: 'Vendor', key: 'vendor', width: 25 }, { header: 'Item', key: 'item', width: 30 }, { header: 'Quantity', key: 'quantity', width: 12 }, { header: 'Unit Price', key: 'unitPrice', width: 15 }, { header: 'Total', key: 'rate', width: 15 }];
         break;
+      }
       case 'online-settlements':
         data = await OnlineSettlement.find(query).sort({ paymentDate: -1 });
         columns = [{ header: 'Platform', key: 'platform', width: 15 }, { header: 'From', key: 'fromDate', width: 15 }, { header: 'To', key: 'toDate', width: 15 }, { header: 'Payment Date', key: 'paymentDate', width: 15 }, { header: 'Gross Sales', key: 'grossSales', width: 15 }, { header: 'Charges', key: 'charges', width: 12 }, { header: 'Expected (G-C)', key: 'expectedPayout', width: 15 }, { header: 'Received', key: 'payoutReceived', width: 15 }, { header: 'Difference', key: 'difference', width: 15 }, { header: 'Reference', key: 'reference', width: 20 }];
@@ -908,23 +988,48 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
     const ws = wb.getWorksheet(1);
     const allowed = ['Food Raw Material', 'Vegetables', 'Flour/Other', 'Packaging', 'Other'];
     const existing = await ManagementInventory.find({});
-    const normed = existing.map(i => normalizeItemName(i.item));
-    const toAdd = [], skipped = [];
+    const existingMap = {};
+    existing.forEach(i => { existingMap[normalizeItemName(i.item)] = i; });
+    const toAdd = [], toUpdate = [];
     ws.eachRow((row, n) => {
       if (n > 1) {
         const name = row.getCell(1).value;
         if (name) {
           const nm = String(name).trim();
           const cat = String(row.getCell(2).value || '').trim();
-          if (!normed.includes(normalizeItemName(nm))) {
-            toAdd.push({ item: nm, category: allowed.includes(cat) ? cat : 'Other', unit: String(row.getCell(3).value || 'Pkt').trim(), threshold: Number(row.getCell(4).value) || 0, createdBy: req.user.role });
-            normed.push(normalizeItemName(nm));
-          } else skipped.push(nm);
+          const unit = String(row.getCell(3).value || 'Pkt').trim();
+          const col4 = row.getCell(4).value;
+          const col5 = row.getCell(5).value;
+          const col6 = row.getCell(6).value;
+          // Detect inventory-stock template (col5 present) vs inventory-master (col4=Threshold only)
+          const hasStockCols = col5 !== null && col5 !== undefined && col5 !== '';
+          const openingStock = hasStockCols ? Number(col4) || 0 : 0;
+          const usedQty      = hasStockCols ? Number(col5) || 0 : 0;
+          const threshold    = hasStockCols ? Number(col6) || 0 : Number(col4) || 0;
+          const normKey = normalizeItemName(nm);
+          if (existingMap[normKey]) {
+            toUpdate.push({ doc: existingMap[normKey], cat, unit, openingStock, usedQty, threshold, hasStockCols });
+          } else {
+            const closingStock = openingStock - usedQty;
+            toAdd.push({ item: nm, category: allowed.includes(cat) ? cat : 'Other', unit, openingStock, usedQty, closingStock, threshold, createdBy: req.user.role });
+            existingMap[normKey] = true;
+          }
         }
       }
     });
     if (toAdd.length) await ManagementInventory.insertMany(toAdd);
-    res.json({ success: true, message: `${toAdd.length} added, ${skipped.length} skipped`, addedCount: toAdd.length, skippedCount: skipped.length });
+    for (const { doc, cat, unit, openingStock, usedQty, threshold, hasStockCols } of toUpdate) {
+      if (cat && allowed.includes(cat)) doc.category = cat;
+      if (unit) doc.unit = unit;
+      if (threshold) doc.threshold = threshold;
+      if (hasStockCols) {
+        doc.openingStock = openingStock;
+        doc.usedQty = usedQty;
+        doc.closingStock = openingStock + (doc.purchasedQty || 0) - usedQty;
+      }
+      await doc.save();
+    }
+    res.json({ success: true, message: `${toAdd.length} added, ${toUpdate.length} updated`, addedCount: toAdd.length, updatedCount: toUpdate.length });
   } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
 });
 
