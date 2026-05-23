@@ -11,6 +11,8 @@ const Vendor = require('../models/Vendor');
 const MasterValue = require('../models/MasterValue');
 const ChecklistLog = require('../models/ChecklistLog');
 const ManagementInventory = require('../models/ManagementInventory');
+const InventoryPeriod = require('../models/InventoryPeriod');
+const InventoryPeriodItem = require('../models/InventoryPeriodItem');
 const Config = require('../models/Config');
 const StaffLeave = require('../models/StaffLeave');
 const { authenticateToken, requireOwner } = require('../middleware/auth');
@@ -28,21 +30,94 @@ const getDateRangeQuery = (fromDate, toDate) => {
   return q;
 };
 
+// Returns the current open InventoryPeriod, creating one on first use.
+// On first creation, seeds period items from legacy ManagementInventory stock fields
+// (still present in MongoDB even after schema update).
+const autoClosePeriodIfExpired = async (period) => {
+  const config = await Config.findOne();
+  const periodDays = config?.inventoryPeriodDays || 7;
+  const ageDays = (Date.now() - new Date(period.periodStart).getTime()) / (1000 * 60 * 60 * 24);
+  if (ageDays < periodDays) return period;
+
+  const now = new Date();
+  period.status = 'closed';
+  period.periodEnd = now;
+  period.closedAt = now;
+  period.closedBy = 'auto';
+  await period.save();
+
+  const newPeriod = await new InventoryPeriod({
+    periodStart: now,
+    label: now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
+  }).save();
+
+  const items = await InventoryPeriodItem.find({ periodId: period._id });
+  if (items.length) {
+    await InventoryPeriodItem.insertMany(items.map(pi => ({
+      periodId: newPeriod._id,
+      item: pi.item,
+      openingStock: pi.closingStock,
+      purchasedQty: 0,
+      usedQty: 0,
+      closingStock: pi.closingStock,
+    })));
+  }
+  return newPeriod;
+};
+
+const getOrCreateCurrentPeriod = async () => {
+  let period = await InventoryPeriod.findOne({ status: 'open' });
+  if (period) return autoClosePeriodIfExpired(period);
+  try {
+    const now = new Date();
+    period = await new InventoryPeriod({
+      periodStart: now,
+      label: now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
+    }).save();
+    // One-time migration: seed from legacy closingStock stored in raw MongoDB docs
+    const rawItems = await ManagementInventory.collection.find({}).toArray();
+    const seeds = rawItems.filter(i => i.item).map(i => ({
+      periodId: period._id,
+      item: i.item,
+      openingStock: Number(i.closingStock) || 0,
+      purchasedQty: 0,
+      usedQty: 0,
+      closingStock: Number(i.closingStock) || 0,
+    }));
+    if (seeds.length) await InventoryPeriodItem.insertMany(seeds, { ordered: false }).catch(() => {});
+    return period;
+  } catch (e) {
+    // Race condition guard: another request may have created it
+    period = await InventoryPeriod.findOne({ status: 'open' });
+    if (period) return period;
+    throw e;
+  }
+};
+
 const updateInventoryStock = async (itemName, quantityChange, role) => {
   const normInput = normalizeItemName(itemName);
-  const allInventory = await ManagementInventory.find({});
-  let inv = allInventory.find(i => normalizeItemName(i.item) === normInput);
-  if (inv) {
-    inv.purchasedQty = (inv.purchasedQty || 0) + quantityChange;
-    inv.closingStock = (inv.openingStock || 0) + inv.purchasedQty - (inv.usedQty || 0);
-    await inv.save();
-  } else if (quantityChange > 0) {
-    await new ManagementInventory({
-      item: itemName, category: 'Other', unit: 'Pkt',
-      openingStock: 0, purchasedQty: quantityChange, usedQty: 0,
-      closingStock: quantityChange, createdBy: role,
-    }).save();
+  const period = await getOrCreateCurrentPeriod();
+
+  // Resolve canonical name from master
+  const allMasters = await ManagementInventory.find({});
+  const master = allMasters.find(m => normalizeItemName(m.item) === normInput);
+  const canonicalName = master ? master.item : itemName;
+
+  // Auto-create master for new items coming from purchase lines
+  if (!master && quantityChange > 0) {
+    await new ManagementInventory({ item: itemName, category: 'Other', unit: 'Pkt', createdBy: role }).save();
   }
+
+  // Find or create period item
+  const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let pi = await InventoryPeriodItem.findOne({
+    periodId: period._id,
+    item: { $regex: new RegExp(`^${safeEscape(canonicalName.trim())}$`, 'i') },
+  });
+  if (!pi) pi = new InventoryPeriodItem({ periodId: period._id, item: canonicalName });
+  pi.purchasedQty = (pi.purchasedQty || 0) + quantityChange;
+  pi.closingStock = (pi.openingStock || 0) + pi.purchasedQty - (pi.usedQty || 0);
+  await pi.save();
 };
 
 // ── Daily Sales ──────────────────────────────────────────────────────────────
@@ -293,11 +368,50 @@ router.delete('/expenses/:id', async (req, res) => {
 
 router.get('/salaries', requireOwner, async (req, res) => {
   try {
-    const { fromDate, toDate } = req.query;
-    const query = {};
-    const dq = getDateRangeQuery(fromDate, toDate);
-    if (dq) query.date = dq;
-    res.json(await Salary.find(query).sort({ date: -1 }));
+    const { fromDate, toDate, employeeName } = req.query;
+    const andClauses = [];
+    if (toDate)   andClauses.push({ fromDate: { $lte: new Date(toDate) } });
+    if (fromDate) andClauses.push({ toDate:   { $gte: new Date(fromDate) } });
+    const query = andClauses.length ? { $and: andClauses } : {};
+    if (employeeName) query.employeeName = new RegExp(`^${employeeName.trim()}$`, 'i');
+    res.json(await Salary.find(query).sort({ fromDate: -1 }));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// Returns leavesTaken (auto-counted) + advanceCarryForward for a given employee + period
+router.get('/salaries/prefill', requireOwner, async (req, res) => {
+  try {
+    const { employeeName, fromDate, toDate } = req.query;
+    if (!employeeName || !fromDate || !toDate) return res.status(400).json({ message: 'employeeName, fromDate, toDate required' });
+
+    const periodStart = new Date(fromDate);
+    const periodEnd   = new Date(toDate);
+
+    // Count leave days that overlap with this salary period
+    const leaveRecords = await StaffLeave.find({
+      employeeName: new RegExp(`^${employeeName.trim()}$`, 'i'),
+      fromDate: { $lte: periodEnd },
+      toDate:   { $gte: periodStart },
+    });
+
+    let leavesTaken = 0;
+    for (const leave of leaveRecords) {
+      const overlapStart = new Date(Math.max(leave.fromDate, periodStart));
+      const overlapEnd   = new Date(Math.min(leave.toDate,   periodEnd));
+      const days = Math.round((overlapEnd - overlapStart) / (1000 * 60 * 60 * 24)) + 1;
+      leavesTaken += leave.leaveType === 'Half Day' ? 0.5 : days;
+    }
+
+    // Sum all Advance entries for this employee that overlap with this period
+    const advanceEntries = await Salary.find({
+      type: 'Advance',
+      employeeName: new RegExp(`^${employeeName.trim()}$`, 'i'),
+      fromDate: { $lte: periodEnd },
+      toDate:   { $gte: periodStart },
+    });
+    const totalAdvance = +advanceEntries.reduce((s, e) => s + (e.amount || 0), 0).toFixed(2);
+
+    res.json({ leavesTaken, totalAdvance });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -396,54 +510,95 @@ router.delete('/checklists/:id', requireOwner, async (req, res) => {
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
 
+// Returns { period, items } — items are master fields joined with current period stock
 router.get('/inventory', async (req, res) => {
-  try { res.json(await ManagementInventory.find().sort({ category: 1, item: 1 })); }
-  catch (e) { res.status(500).json({ message: e.message }); }
+  try {
+    const period = await getOrCreateCurrentPeriod();
+    const [masters, periodItems] = await Promise.all([
+      ManagementInventory.find().sort({ category: 1, item: 1 }),
+      InventoryPeriodItem.find({ periodId: period._id }),
+    ]);
+    const piMap = {};
+    periodItems.forEach(pi => { piMap[normalizeItemName(pi.item)] = pi; });
+    const items = masters.map(m => {
+      const pi = piMap[normalizeItemName(m.item)] || {};
+      return {
+        _id: m._id,
+        item: m.item,
+        category: m.category,
+        unit: m.unit,
+        threshold: m.threshold,
+        subCategory: m.subCategory,
+        createdBy: m.createdBy,
+        updatedAt: pi.updatedAt || m.updatedAt,
+        openingStock: pi.openingStock || 0,
+        purchasedQty: pi.purchasedQty || 0,
+        usedQty: pi.usedQty || 0,
+        closingStock: pi.closingStock || 0,
+        periodItemId: pi._id,
+      };
+    });
+    res.json({ period, items });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 router.post('/inventory', async (req, res) => {
   try {
     const { item, category, unit, openingStock, usedQty, closingStock, threshold, subCategory, physicalCount } = req.body;
-    let inv = await ManagementInventory.findOne({ item: { $regex: new RegExp(`^${item.trim()}$`, 'i') } });
-    if (inv) {
-      if (req.user.role === 'staff') {
-        if (physicalCount !== undefined) {
-          const count = Number(physicalCount);
-          const systemTotal = (inv.openingStock || 0) + (inv.purchasedQty || 0);
-          if (count > systemTotal) {
-            return res.status(400).json({
-              message: `Count (${count}) exceeds system stock (${systemTotal} ${inv.unit || ''}). Record a purchase first.`,
-            });
-          }
-          inv.usedQty = systemTotal - count;
-          inv.closingStock = count;
-        } else {
-          // Legacy path (backward compat)
-          if (openingStock !== undefined) inv.openingStock = openingStock;
-          if (usedQty !== undefined) inv.usedQty = usedQty;
-          inv.closingStock = (inv.openingStock || 0) + (inv.purchasedQty || 0) - (inv.usedQty || 0);
-        }
-      } else {
-        if (category) inv.category = category;
-        if (unit) inv.unit = unit;
-        if (subCategory !== undefined) inv.subCategory = subCategory;
-        if (openingStock !== undefined) inv.openingStock = openingStock;
-        if (usedQty !== undefined) inv.usedQty = usedQty;
-        if (threshold !== undefined) inv.threshold = threshold;
-        inv.closingStock = closingStock !== undefined ? closingStock
-          : (inv.openingStock || 0) + (inv.purchasedQty || 0) - (inv.usedQty || 0);
+    const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nameRx = new RegExp(`^${safeEscape(item.trim())}$`, 'i');
+    let master = await ManagementInventory.findOne({ item: nameRx });
+
+    if (req.user.role === 'staff') {
+      if (!master) return res.status(404).json({ message: 'Item not found' });
+      const period = await getOrCreateCurrentPeriod();
+      const pi = await InventoryPeriodItem.findOne({ periodId: period._id, item: nameRx });
+      if (!pi) return res.status(404).json({ message: 'Item not found in current period — ask owner to sync.' });
+      if (physicalCount === undefined) return res.status(400).json({ message: 'physicalCount required' });
+      const count = Number(physicalCount);
+      const systemTotal = (pi.openingStock || 0) + (pi.purchasedQty || 0);
+      if (count > systemTotal) {
+        return res.status(400).json({
+          message: `Count (${count}) exceeds system stock (${systemTotal} ${master.unit || ''}). Record a purchase first.`,
+        });
       }
-      res.json(await inv.save());
+      pi.usedQty = systemTotal - count;
+      pi.closingStock = count;
+      await pi.save();
+      return res.json({ ...pi.toObject(), item: master.item, unit: master.unit });
+    }
+
+    // Owner path
+    const period = await getOrCreateCurrentPeriod();
+    if (master) {
+      if (category) master.category = category;
+      if (unit) master.unit = unit;
+      if (subCategory !== undefined) master.subCategory = subCategory;
+      if (threshold !== undefined) master.threshold = Number(threshold);
+      await master.save();
+
+      let pi = await InventoryPeriodItem.findOne({ periodId: period._id, item: nameRx });
+      if (!pi) pi = new InventoryPeriodItem({ periodId: period._id, item: master.item });
+      if (openingStock !== undefined) pi.openingStock = Number(openingStock);
+      if (usedQty !== undefined) pi.usedQty = Number(usedQty);
+      pi.closingStock = closingStock !== undefined ? Number(closingStock)
+        : (pi.openingStock || 0) + (pi.purchasedQty || 0) - (pi.usedQty || 0);
+      await pi.save();
+      return res.json({ ...master.toObject(), openingStock: pi.openingStock, purchasedQty: pi.purchasedQty, usedQty: pi.usedQty, closingStock: pi.closingStock });
     } else {
-      if (req.user.role === 'staff') return res.status(403).json({ message: 'Staff cannot create inventory items' });
-      inv = await new ManagementInventory({
-        item, category, unit, openingStock, usedQty,
-        closingStock: closingStock !== undefined ? closingStock : (openingStock || 0) - (usedQty || 0),
-        threshold: threshold || 0,
-        subCategory: subCategory || '',
+      master = await new ManagementInventory({
+        item: item.trim(), category, unit,
+        threshold: threshold || 0, subCategory: subCategory || '',
         createdBy: req.user.role,
       }).save();
-      res.status(201).json(inv);
+      const initOpen = Number(openingStock) || 0;
+      const initUsed = Number(usedQty) || 0;
+      const pi = await new InventoryPeriodItem({
+        periodId: period._id, item: master.item,
+        openingStock: initOpen, purchasedQty: 0, usedQty: initUsed,
+        closingStock: closingStock !== undefined ? Number(closingStock) : initOpen - initUsed,
+      }).save();
+      return res.status(201).json({ ...master.toObject(), openingStock: pi.openingStock, purchasedQty: pi.purchasedQty, usedQty: pi.usedQty, closingStock: pi.closingStock });
     }
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
@@ -461,8 +616,111 @@ router.put('/inventory/threshold', requireOwner, async (req, res) => {
 });
 
 router.delete('/inventory/:id', requireOwner, async (req, res) => {
-  try { await ManagementInventory.findByIdAndDelete(req.params.id); res.json({ message: 'Deleted' }); }
+  try {
+    const master = await ManagementInventory.findByIdAndDelete(req.params.id);
+    if (master) {
+      // Remove from current open period only; historical periods keep their snapshot
+      const period = await InventoryPeriod.findOne({ status: 'open' });
+      if (period) {
+        const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        await InventoryPeriodItem.deleteOne({ periodId: period._id, item: { $regex: new RegExp(`^${safeEscape(master.item.trim())}$`, 'i') } });
+      }
+    }
+    res.json({ message: 'Deleted' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── Inventory Periods ─────────────────────────────────────────────────────────
+
+router.get('/inventory/periods', async (req, res) => {
+  try { res.json(await InventoryPeriod.find().sort({ periodStart: -1 })); }
   catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/inventory/periods/close', requireOwner, async (req, res) => {
+  try {
+    const current = await InventoryPeriod.findOne({ status: 'open' });
+    if (!current) return res.status(400).json({ message: 'No open period found' });
+    const now = new Date();
+    current.status = 'closed';
+    current.periodEnd = now;
+    current.closedAt = now;
+    current.closedBy = req.user.role;
+    await current.save();
+
+    const newPeriod = await new InventoryPeriod({
+      periodStart: now,
+      label: now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
+    }).save();
+
+    const currentItems = await InventoryPeriodItem.find({ periodId: current._id });
+    if (currentItems.length) {
+      await InventoryPeriodItem.insertMany(currentItems.map(pi => ({
+        periodId: newPeriod._id,
+        item: pi.item,
+        openingStock: pi.closingStock,
+        purchasedQty: 0,
+        usedQty: 0,
+        closingStock: pi.closingStock,
+      })));
+    }
+    res.json({ closed: current, opened: newPeriod });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/inventory/periods/reopen-last', requireOwner, async (req, res) => {
+  try {
+    const current = await InventoryPeriod.findOne({ status: 'open' });
+    if (!current) return res.status(400).json({ message: 'No open period found' });
+
+    const currentItems = await InventoryPeriodItem.find({ periodId: current._id });
+    const hasActivity = currentItems.some(pi => (pi.purchasedQty || 0) > 0 || (pi.usedQty || 0) > 0);
+    if (hasActivity) {
+      return res.status(400).json({ message: 'Cannot reopen: purchases or stock counts have already been recorded in the new period.' });
+    }
+
+    const lastClosed = await InventoryPeriod.findOne({ status: 'closed' }).sort({ closedAt: -1 });
+    if (!lastClosed) return res.status(400).json({ message: 'No closed period to reopen' });
+
+    await InventoryPeriodItem.deleteMany({ periodId: current._id });
+    await InventoryPeriod.findByIdAndDelete(current._id);
+
+    lastClosed.status = 'open';
+    lastClosed.periodEnd = undefined;
+    lastClosed.closedAt = undefined;
+    lastClosed.closedBy = undefined;
+    await lastClosed.save();
+
+    res.json(lastClosed);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.get('/inventory/periods/:id/items', async (req, res) => {
+  try {
+    const period = await InventoryPeriod.findById(req.params.id);
+    if (!period) return res.status(404).json({ message: 'Period not found' });
+    const [masters, periodItems] = await Promise.all([
+      ManagementInventory.find(),
+      InventoryPeriodItem.find({ periodId: period._id }),
+    ]);
+    const masterMap = {};
+    masters.forEach(m => { masterMap[normalizeItemName(m.item)] = m; });
+    const items = periodItems.map(pi => {
+      const m = masterMap[normalizeItemName(pi.item)] || {};
+      return {
+        item: pi.item,
+        category: m.category || 'Other',
+        unit: m.unit || '',
+        threshold: m.threshold || 0,
+        subCategory: m.subCategory || '',
+        openingStock: pi.openingStock,
+        purchasedQty: pi.purchasedQty,
+        usedQty: pi.usedQty,
+        closingStock: pi.closingStock,
+      };
+    });
+    res.json({ period, items });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 // ── Staff Quick Purchase ──────────────────────────────────────────────────────
@@ -621,21 +879,51 @@ router.get('/reports/purchase-summary', requireOwner, async (req, res) => {
 
 // ── Inventory Snapshot Report ─────────────────────────────────────────────────
 
+// Accepts optional ?periodId= to view a closed period; defaults to current open period.
 router.get('/reports/inventory-snapshot', requireOwner, async (req, res) => {
   try {
-    const items = await ManagementInventory.find().sort({ category: 1, item: 1 });
-    res.json(items.map(i => ({
-      _id: i._id,
-      item: i.item,
-      category: i.category,
-      unit: i.unit,
-      openingStock: i.openingStock,
-      purchasedQty: i.purchasedQty,
-      usedQty: i.usedQty,
-      closingStock: i.closingStock,
-      threshold: i.threshold,
-      status: i.threshold > 0 && i.closingStock <= i.threshold ? 'Low' : 'OK',
-    })));
+    const { periodId } = req.query;
+    let period;
+    if (periodId) {
+      period = await InventoryPeriod.findById(periodId);
+      if (!period) return res.status(404).json({ message: 'Period not found' });
+    } else {
+      period = await getOrCreateCurrentPeriod();
+    }
+    const [masters, periodItems] = await Promise.all([
+      ManagementInventory.find().sort({ category: 1, item: 1 }),
+      InventoryPeriodItem.find({ periodId: period._id }),
+    ]);
+    const piMap = {};
+    periodItems.forEach(pi => { piMap[normalizeItemName(pi.item)] = pi; });
+    const items = masters.map(m => {
+      const pi = piMap[normalizeItemName(m.item)] || {};
+      const closing = pi.closingStock || 0;
+      return {
+        _id: m._id, item: m.item, category: m.category, unit: m.unit,
+        subCategory: m.subCategory,
+        openingStock: pi.openingStock || 0,
+        purchasedQty: pi.purchasedQty || 0,
+        usedQty: pi.usedQty || 0,
+        closingStock: closing,
+        threshold: m.threshold,
+        status: m.threshold > 0 && closing <= m.threshold ? 'Low' : 'OK',
+      };
+    });
+    // For historical periods, also include deleted items that still have period data
+    if (periodId) {
+      const masterNames = new Set(masters.map(m => normalizeItemName(m.item)));
+      periodItems.forEach(pi => {
+        if (!masterNames.has(normalizeItemName(pi.item))) {
+          items.push({
+            item: pi.item, category: 'Other', unit: '', subCategory: '',
+            openingStock: pi.openingStock, purchasedQty: pi.purchasedQty,
+            usedQty: pi.usedQty, closingStock: pi.closingStock, threshold: 0, status: 'OK',
+          });
+        }
+      });
+    }
+    res.json({ period, items });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -661,9 +949,10 @@ router.get('/reports/inventory-movement', requireOwner, async (req, res) => {
       { $sort: { timesOrdered: -1 } },
     ]);
 
-    const inventory = await ManagementInventory.find({});
+    const period = await getOrCreateCurrentPeriod();
+    const periodItems = await InventoryPeriodItem.find({ periodId: period._id });
     const invMap = {};
-    inventory.forEach(i => { invMap[normalizeItemName(i.item)] = i.usedQty || 0; });
+    periodItems.forEach(pi => { invMap[normalizeItemName(pi.item)] = pi.usedQty || 0; });
 
     const total = lines.length;
     const fastCut = Math.ceil(total / 3);
@@ -719,13 +1008,14 @@ router.get('/config', requireOwner, async (req, res) => {
 
 router.put('/config', requireOwner, async (req, res) => {
   try {
-    const { cafeName, ownerEmail, ownerPin, staffPin } = req.body;
+    const { cafeName, ownerEmail, ownerPin, staffPin, inventoryPeriodDays } = req.body;
     let config = await Config.findOne();
     if (!config) config = new Config();
     if (cafeName !== undefined) config.cafeName = cafeName;
     if (ownerEmail !== undefined) config.ownerEmail = ownerEmail;
     if (ownerPin !== undefined && ownerPin.trim()) config.ownerPin = ownerPin;
     if (staffPin !== undefined && staffPin.trim()) config.staffPin = staffPin;
+    if (inventoryPeriodDays !== undefined) config.inventoryPeriodDays = Math.max(1, Number(inventoryPeriodDays) || 7);
     res.json(await config.save());
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
@@ -758,38 +1048,40 @@ router.get('/download-template', requireOwner, async (req, res) => {
 
     } else if (type === 'inventory-master') {
       ws.columns = [
-        { header: 'Item Name', key: 'item', width: 30 },
-        { header: 'Category', key: 'category', width: 25 },
-        { header: 'Unit', key: 'unit', width: 12 },
-        { header: 'Low Stock Threshold', key: 'threshold', width: 22 },
+        { header: 'Item Name',           key: 'item',        width: 30 },
+        { header: 'Category',            key: 'category',    width: 25 },
+        { header: 'Sub Category',        key: 'subCategory', width: 20 },
+        { header: 'Unit',                key: 'unit',        width: 12 },
+        { header: 'Low Stock Threshold', key: 'threshold',   width: 22 },
       ];
       ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
       [
-        ['Mozzarella Cheese', 'Food Raw Material', 'Pkt', 5],
-        ['Onion', 'Vegetables', 'Kg', 2],
-        ['Maida', 'Flour/Other', 'Bag', 1],
-        ['Pizza Box 7"', 'Packaging', 'Pkt', 10],
+        ['Mozzarella Cheese', 'Food Raw Material', 'dairy',    'Pkt', 5],
+        ['Onion',             'Vegetables',        '',          'Kg',  2],
+        ['Maida',             'Flour/Other',       'flour',     'Bag', 1],
+        ['Pizza Box 7"',      'Packaging',         'boxes',     'Pkt', 10],
       ].forEach(r => ws.addRow(r));
-      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Pkt, Kg, Bag, Ltr…', '← Alert when closing stock ≤ this']);
+      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Optional (e.g. dairy, spices)', '← Pkt, Kg, Bag, Ltr…', '← Alert when closing stock ≤ this']);
       noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
 
     } else if (type === 'inventory-stock') {
       ws.columns = [
-        { header: 'Item Name', key: 'item', width: 30 },
-        { header: 'Category', key: 'category', width: 25 },
-        { header: 'Unit', key: 'unit', width: 12 },
-        { header: 'Opening Stock', key: 'openingStock', width: 16 },
-        { header: 'Used Qty', key: 'usedQty', width: 14 },
-        { header: 'Low Stock Threshold', key: 'threshold', width: 22 },
+        { header: 'Item Name',           key: 'item',          width: 30 },
+        { header: 'Category',            key: 'category',      width: 25 },
+        { header: 'Sub Category',        key: 'subCategory',   width: 20 },
+        { header: 'Unit',                key: 'unit',          width: 12 },
+        { header: 'Opening Stock',       key: 'openingStock',  width: 16 },
+        { header: 'Used Qty',            key: 'usedQty',       width: 14 },
+        { header: 'Low Stock Threshold', key: 'threshold',     width: 22 },
       ];
       ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
       [
-        ['Mozzarella Cheese', 'Food Raw Material', 'Pkt', 10, 3, 5],
-        ['Onion', 'Vegetables', 'Kg', 5, 2, 2],
-        ['Maida', 'Flour/Other', 'Bag', 2, 1, 1],
-        ['Pizza Box 7"', 'Packaging', 'Pkt', 50, 20, 10],
+        ['Mozzarella Cheese', 'Food Raw Material', 'dairy',  'Pkt', 10, 3, 5],
+        ['Onion',             'Vegetables',        '',        'Kg',  5,  2, 2],
+        ['Maida',             'Flour/Other',       'flour',   'Bag', 2,  1, 1],
+        ['Pizza Box 7"',      'Packaging',         'boxes',   'Pkt', 50, 20, 10],
       ].forEach(r => ws.addRow(r));
-      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Pkt, Kg, Bag, Ltr…', '← Stock at start of period', '← How much was used', '← Alert threshold']);
+      const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Optional (e.g. dairy, spices)', '← Pkt, Kg, Bag, Ltr…', '← Stock at start of period', '← How much was used', '← Alert threshold']);
       noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
     } else {
       return res.status(400).json({ message: 'Unknown template type' });
@@ -1073,38 +1365,55 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
         const name = row.getCell(1).value;
         if (name) {
           const nm = String(name).trim();
-          const cat = String(row.getCell(2).value || '').trim();
-          const unit = String(row.getCell(3).value || 'Pkt').trim();
-          const col4 = row.getCell(4).value;
+          const cat         = String(row.getCell(2).value || '').trim();
+          const subCategory = String(row.getCell(3).value || '').trim();
+          const unit        = String(row.getCell(4).value || 'Pkt').trim();
           const col5 = row.getCell(5).value;
           const col6 = row.getCell(6).value;
-          // Detect inventory-stock template (col5 present) vs inventory-master (col4=Threshold only)
-          const hasStockCols = col5 !== null && col5 !== undefined && col5 !== '';
-          const openingStock = hasStockCols ? Number(col4) || 0 : 0;
-          const usedQty      = hasStockCols ? Number(col5) || 0 : 0;
-          const threshold    = hasStockCols ? Number(col6) || 0 : Number(col4) || 0;
+          const col7 = row.getCell(7).value;
+          // inventory-stock has UsedQty in col6; inventory-master has only Threshold in col5
+          const hasStockCols = col6 !== null && col6 !== undefined && col6 !== '';
+          const openingStock = hasStockCols ? Number(col5) || 0 : 0;
+          const usedQty      = hasStockCols ? Number(col6) || 0 : 0;
+          const threshold    = hasStockCols ? Number(col7) || 0 : Number(col5) || 0;
           const normKey = normalizeItemName(nm);
           if (existingMap[normKey]) {
-            toUpdate.push({ doc: existingMap[normKey], cat, unit, openingStock, usedQty, threshold, hasStockCols });
+            toUpdate.push({ doc: existingMap[normKey], cat, subCategory, unit, openingStock, usedQty, threshold, hasStockCols });
           } else {
             const closingStock = openingStock - usedQty;
-            toAdd.push({ item: nm, category: allowed.includes(cat) ? cat : 'Other', unit, openingStock, usedQty, closingStock, threshold, createdBy: req.user.role });
+            toAdd.push({ item: nm, category: allowed.includes(cat) ? cat : 'Other', subCategory, unit, openingStock, usedQty, closingStock, threshold, createdBy: req.user.role });
             existingMap[normKey] = true;
           }
         }
       }
     });
-    if (toAdd.length) await ManagementInventory.insertMany(toAdd);
-    for (const { doc, cat, unit, openingStock, usedQty, threshold, hasStockCols } of toUpdate) {
+    const period = await getOrCreateCurrentPeriod();
+    const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const d of toAdd) {
+      const m = await new ManagementInventory({
+        item: d.item, category: d.category, unit: d.unit,
+        threshold: d.threshold || 0, subCategory: d.subCategory || '', createdBy: d.createdBy,
+      }).save();
+      await new InventoryPeriodItem({
+        periodId: period._id, item: m.item,
+        openingStock: d.openingStock || 0, purchasedQty: 0, usedQty: d.usedQty || 0,
+        closingStock: (d.openingStock || 0) - (d.usedQty || 0),
+      }).save();
+    }
+    for (const { doc, cat, subCategory, unit, openingStock, usedQty, threshold, hasStockCols } of toUpdate) {
       if (cat && allowed.includes(cat)) doc.category = cat;
       if (unit) doc.unit = unit;
       if (threshold) doc.threshold = threshold;
-      if (hasStockCols) {
-        doc.openingStock = openingStock;
-        doc.usedQty = usedQty;
-        doc.closingStock = openingStock + (doc.purchasedQty || 0) - usedQty;
-      }
+      if (subCategory !== undefined) doc.subCategory = subCategory;
       await doc.save();
+      if (hasStockCols) {
+        let pi = await InventoryPeriodItem.findOne({ periodId: period._id, item: { $regex: new RegExp(`^${safeEscape(doc.item.trim())}$`, 'i') } });
+        if (!pi) pi = new InventoryPeriodItem({ periodId: period._id, item: doc.item });
+        pi.openingStock = openingStock;
+        pi.usedQty = usedQty;
+        pi.closingStock = openingStock + (pi.purchasedQty || 0) - usedQty;
+        await pi.save();
+      }
     }
     res.json({ success: true, message: `${toAdd.length} added, ${toUpdate.length} updated`, addedCount: toAdd.length, updatedCount: toUpdate.length });
   } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
@@ -1116,18 +1425,43 @@ router.get('/staff-leaves', async (req, res) => {
   try {
     const { fromDate, toDate, employeeName } = req.query;
     const query = {};
-    const dq = getDateRangeQuery(fromDate, toDate);
-    if (dq) query.date = dq;
+    if (fromDate || toDate) {
+      query.$and = [];
+      if (toDate)   query.$and.push({ fromDate: { $lte: new Date(toDate) } });
+      if (fromDate) query.$and.push({ toDate:   { $gte: new Date(fromDate) } });
+    }
     if (employeeName) query.employeeName = new RegExp(employeeName.trim(), 'i');
-    res.json(await StaffLeave.find(query).sort({ date: -1 }));
+    const leaves = await StaffLeave.find(query).sort({ fromDate: -1 }).lean();
+    // migrate legacy records that only have `date`
+    res.json(leaves.map(l => {
+      if (!l.fromDate && l.date) { l.fromDate = l.date; l.toDate = l.date; }
+      return l;
+    }));
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 router.post('/staff-leaves', requireOwner, async (req, res) => {
   try {
-    const { employeeName, date, leaveType, notes } = req.body;
-    const leave = await new StaffLeave({ employeeName, date, leaveType, notes, createdBy: req.user.role }).save();
+    const { employeeName, fromDate, toDate, leaveType, notes } = req.body;
+    if (!fromDate || !toDate) return res.status(400).json({ message: 'From date and To date are required' });
+    if (new Date(toDate) < new Date(fromDate)) return res.status(400).json({ message: 'To date cannot be before From date' });
+    const leave = await new StaffLeave({ employeeName, fromDate, toDate, leaveType, notes, createdBy: req.user.role }).save();
     res.status(201).json(leave);
+  } catch (e) { res.status(400).json({ message: e.message }); }
+});
+
+router.put('/staff-leaves/:id', requireOwner, async (req, res) => {
+  try {
+    const { employeeName, fromDate, toDate, leaveType, notes } = req.body;
+    if (!fromDate || !toDate) return res.status(400).json({ message: 'From date and To date are required' });
+    if (new Date(toDate) < new Date(fromDate)) return res.status(400).json({ message: 'To date cannot be before From date' });
+    const leave = await StaffLeave.findByIdAndUpdate(
+      req.params.id,
+      { employeeName, fromDate, toDate, leaveType, notes },
+      { new: true, runValidators: true }
+    );
+    if (!leave) return res.status(404).json({ message: 'Leave not found' });
+    res.json(leave);
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
 

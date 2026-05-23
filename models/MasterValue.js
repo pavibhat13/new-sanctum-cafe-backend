@@ -6,7 +6,9 @@ const masterValueSchema = new mongoose.Schema({
     enum: ['Expense Category', 'Payment Method', 'Cleaning Checklist', 'Hygiene Checklist', 'Employee'],
     required: true,
   },
-  value: { type: String, required: true, trim: true },
+  value:          { type: String, required: true, trim: true },
+  salary:         { type: Number },  // Employee only: fixed monthly salary
+  allowedLeaves:  { type: Number },  // Employee only: free leaves per period
 }, { timestamps: true });
 
 masterValueSchema.index({ type: 1, value: 1 }, { unique: true });
