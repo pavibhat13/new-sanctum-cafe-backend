@@ -7,6 +7,7 @@ const purchaseLineSchema = new mongoose.Schema({
   rate: { type: Number, required: true, min: 0 },
   unitPrice: { type: Number },
   total: { type: Number },
+  note: { type: String, default: '', trim: true },
   createdBy: { type: String, default: 'owner' },
 }, { timestamps: true });
 

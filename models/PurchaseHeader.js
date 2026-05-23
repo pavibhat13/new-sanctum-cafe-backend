@@ -12,6 +12,8 @@ const purchaseHeaderSchema = new mongoose.Schema({
     default: 'Cash',
   },
   notes: { type: String, maxlength: 500 },
+  source: { type: String, enum: ['owner', 'staff'], default: 'owner' },
+  reviewed: { type: Boolean, default: false },
   createdBy: { type: String, default: 'owner' },
 }, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
 

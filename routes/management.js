@@ -102,11 +102,12 @@ router.delete('/daily-sales/:id', requireOwner, async (req, res) => {
 
 router.get('/purchase-headers', requireOwner, async (req, res) => {
   try {
-    const { fromDate, toDate, vendor } = req.query;
+    const { fromDate, toDate, vendor, source } = req.query;
     const query = {};
     const dq = getDateRangeQuery(fromDate, toDate);
     if (dq) query.date = dq;
     if (vendor) query.vendor = vendor;
+    if (source) query.source = source;
     res.json(await PurchaseHeader.find(query).sort({ date: -1 }));
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -178,11 +179,12 @@ router.put('/purchase-lines/:id', requireOwner, async (req, res) => {
     const line = await PurchaseLine.findById(req.params.id);
     if (!line) return res.status(404).json({ message: 'Not found' });
     const oldQty = line.quantity, oldItem = line.item;
-    const { purchaseHeader, item, quantity, rate } = req.body;
+    const { purchaseHeader, item, quantity, rate, note } = req.body;
     if (purchaseHeader !== undefined) line.purchaseHeader = purchaseHeader;
     if (item !== undefined) line.item = item;
     if (quantity !== undefined) line.quantity = quantity;
     if (rate !== undefined) line.rate = rate;
+    if (note !== undefined) line.note = note;
     const saved = await line.save();
     if (item !== undefined || quantity !== undefined) {
       await updateInventoryStock(oldItem, -oldQty, req.user.role);
@@ -401,17 +403,30 @@ router.get('/inventory', async (req, res) => {
 
 router.post('/inventory', async (req, res) => {
   try {
-    const { item, category, unit, openingStock, usedQty, closingStock, threshold } = req.body;
+    const { item, category, unit, openingStock, usedQty, closingStock, threshold, subCategory, physicalCount } = req.body;
     let inv = await ManagementInventory.findOne({ item: { $regex: new RegExp(`^${item.trim()}$`, 'i') } });
     if (inv) {
       if (req.user.role === 'staff') {
-        // Staff can only update quantities (openingStock and usedQty); metadata is owner-only
-        if (openingStock !== undefined) inv.openingStock = openingStock;
-        if (usedQty !== undefined) inv.usedQty = usedQty;
-        inv.closingStock = (inv.openingStock || 0) + (inv.purchasedQty || 0) - (inv.usedQty || 0);
+        if (physicalCount !== undefined) {
+          const count = Number(physicalCount);
+          const systemTotal = (inv.openingStock || 0) + (inv.purchasedQty || 0);
+          if (count > systemTotal) {
+            return res.status(400).json({
+              message: `Count (${count}) exceeds system stock (${systemTotal} ${inv.unit || ''}). Record a purchase first.`,
+            });
+          }
+          inv.usedQty = systemTotal - count;
+          inv.closingStock = count;
+        } else {
+          // Legacy path (backward compat)
+          if (openingStock !== undefined) inv.openingStock = openingStock;
+          if (usedQty !== undefined) inv.usedQty = usedQty;
+          inv.closingStock = (inv.openingStock || 0) + (inv.purchasedQty || 0) - (inv.usedQty || 0);
+        }
       } else {
         if (category) inv.category = category;
         if (unit) inv.unit = unit;
+        if (subCategory !== undefined) inv.subCategory = subCategory;
         if (openingStock !== undefined) inv.openingStock = openingStock;
         if (usedQty !== undefined) inv.usedQty = usedQty;
         if (threshold !== undefined) inv.threshold = threshold;
@@ -425,6 +440,7 @@ router.post('/inventory', async (req, res) => {
         item, category, unit, openingStock, usedQty,
         closingStock: closingStock !== undefined ? closingStock : (openingStock || 0) - (usedQty || 0),
         threshold: threshold || 0,
+        subCategory: subCategory || '',
         createdBy: req.user.role,
       }).save();
       res.status(201).json(inv);
@@ -449,6 +465,57 @@ router.delete('/inventory/:id', requireOwner, async (req, res) => {
   catch (e) { res.status(500).json({ message: e.message }); }
 });
 
+// ── Staff Quick Purchase ──────────────────────────────────────────────────────
+// Both staff and owner can submit; creates a Purchase Header + Line atomically
+
+router.post('/staff-purchase', async (req, res) => {
+  try {
+    const { item, quantity, amount, vendor, date, note } = req.body;
+    if (!item || !item.trim()) return res.status(400).json({ message: 'Item is required' });
+    if (!quantity || Number(quantity) <= 0) return res.status(400).json({ message: 'Quantity must be greater than 0' });
+    if (amount === undefined || Number(amount) < 0) return res.status(400).json({ message: 'Amount is required' });
+
+    const purchaseDate = date ? new Date(date) : new Date();
+    const dateStr = purchaseDate.toISOString().slice(0, 10).replace(/-/g, '');
+    const billNo = `STAFF-${dateStr}-${Date.now().toString().slice(-6)}`;
+
+    const header = await new PurchaseHeader({
+      billNo,
+      vendor: (vendor && vendor.trim()) || 'Staff Purchase',
+      date: purchaseDate,
+      totalAmount: Number(amount),
+      paymentMethod: 'Cash',
+      notes: note || '',
+      source: 'staff',
+      reviewed: false,
+      createdBy: req.user.role,
+    }).save();
+
+    const line = await new PurchaseLine({
+      purchaseHeader: header._id,
+      item: item.trim(),
+      quantity: Number(quantity),
+      rate: Number(amount),
+      note: note || '',
+      createdBy: req.user.role,
+    }).save();
+
+    await updateInventoryStock(line.item, line.quantity, req.user.role);
+
+    res.status(201).json({ header, line });
+  } catch (e) { res.status(400).json({ message: e.message }); }
+});
+
+router.put('/purchase-headers/:id/review', requireOwner, async (req, res) => {
+  try {
+    const header = await PurchaseHeader.findByIdAndUpdate(
+      req.params.id, { reviewed: true }, { new: true }
+    );
+    if (!header) return res.status(404).json({ message: 'Not found' });
+    res.json(header);
+  } catch (e) { res.status(400).json({ message: e.message }); }
+});
+
 // ── Dashboard Stats ───────────────────────────────────────────────────────────
 
 router.get('/dashboard-stats', requireOwner, async (req, res) => {
@@ -464,6 +531,9 @@ router.get('/dashboard-stats', requireOwner, async (req, res) => {
     const expenseData = await Expense.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]);
     const totalExpenses = expenseData.length ? expenseData[0].total : 0;
 
+    const salaryData = await Salary.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]);
+    const totalSalaries = salaryData.length ? salaryData[0].total : 0;
+
     const settlementData = await OnlineSettlement.aggregate([{ $group: { _id: null, totalCharges: { $sum: '$charges' } } }]);
     const onlineCharges = settlementData.length ? settlementData[0].totalCharges : 0;
 
@@ -471,6 +541,8 @@ router.get('/dashboard-stats', requireOwner, async (req, res) => {
       threshold: { $gt: 0 },
       $expr: { $lte: ['$closingStock', '$threshold'] },
     });
+
+    const unreviewedStaffPurchases = await PurchaseHeader.countDocuments({ source: 'staff', reviewed: false });
 
     const topVendors = await PurchaseHeader.aggregate([
       { $group: { _id: '$vendor', total: { $sum: '$totalAmount' } } },
@@ -481,12 +553,13 @@ router.get('/dashboard-stats', requireOwner, async (req, res) => {
     const recentSales = await DailySales.find().sort({ date: -1 }).limit(7);
 
     res.json({
-      totalSales, totalPurchases, totalExpenses, onlineCharges,
+      totalSales, totalPurchases, totalExpenses, totalSalaries, onlineCharges,
       offlineSales, onlineSales,
-      simplePnL: totalSales - totalPurchases - totalExpenses,
-      detailedPnL: totalSales - totalPurchases - totalExpenses - onlineCharges,
+      simplePnL: totalSales - totalPurchases - totalExpenses - totalSalaries,
+      detailedPnL: totalSales - totalPurchases - totalExpenses - totalSalaries - onlineCharges,
       lowStockItems,
       thresholdAlerts: lowStockItems.length,
+      unreviewedStaffPurchases,
       topVendors,
       recentSales,
     });
@@ -503,11 +576,12 @@ router.get('/reports', requireOwner, async (req, res) => {
     const dq = { date: { $gte: start, $lte: end } };
     const dqPay = { paymentDate: { $gte: start, $lte: end } };
 
-    const [salesAgg, purchaseAgg, expenseAgg, settlementAgg] = await Promise.all([
+    const [salesAgg, purchaseAgg, expenseAgg, settlementAgg, salaryAgg] = await Promise.all([
       DailySales.aggregate([{ $match: dq }, { $group: { _id: null, totalSales: { $sum: '$total' }, cashSales: { $sum: '$cash' }, upiSales: { $sum: '$upi' }, swiggySales: { $sum: '$swiggy' }, zomatoSales: { $sum: '$zomato' } } }]),
       PurchaseHeader.aggregate([{ $match: dq }, { $group: { _id: null, totalPurchases: { $sum: '$totalAmount' } } }]),
       Expense.aggregate([{ $match: dq }, { $group: { _id: null, totalExpenses: { $sum: '$amount' } } }]),
       OnlineSettlement.aggregate([{ $match: dqPay }, { $group: { _id: null, totalCharges: { $sum: '$charges' }, totalReceived: { $sum: '$payoutReceived' }, totalGrossSales: { $sum: '$grossSales' } } }]),
+      Salary.aggregate([{ $match: dq }, { $group: { _id: null, totalSalaries: { $sum: '$amount' } } }]),
     ]);
 
     res.json({
@@ -515,6 +589,7 @@ router.get('/reports', requireOwner, async (req, res) => {
       purchases: purchaseAgg[0] || { totalPurchases: 0 },
       expenses: expenseAgg[0] || { totalExpenses: 0 },
       settlements: settlementAgg[0] || { totalCharges: 0, totalReceived: 0, totalGrossSales: 0 },
+      salaries: salaryAgg[0] || { totalSalaries: 0 },
     });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -673,11 +748,12 @@ router.get('/download-template', requireOwner, async (req, res) => {
         { header: 'Item', key: 'item', width: 30 },
         { header: 'Qty', key: 'qty', width: 12 },
         { header: 'Total Amount (₹)', key: 'total', width: 20 },
+        { header: 'Note', key: 'note', width: 28 },
       ];
       ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
-      const samples = [['Onion', 5.5, 100], ['Tomato', 3, 60], ['Mozzarella Cheese', 2, 500]];
+      const samples = [['Onion', 5.5, 100, ''], ['Tomato', 3, 60, ''], ['Mozzarella Cheese', 2, 500, 'Exp: Dec 2026']];
       samples.forEach(r => ws.addRow(r));
-      const noteRow = ws.addRow(['← Item name (text)', '← Quantity', '← Total cost for this line (not unit price). Grand total must match bill amount.']);
+      const noteRow = ws.addRow(['← Item name (text)', '← Quantity', '← Total cost for this line (not unit price). Grand total must match bill amount.', '← Optional note (expiry, batch no…)']);
       noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
 
     } else if (type === 'inventory-master') {
@@ -947,8 +1023,9 @@ router.post('/parse-invoice', requireOwner, async (req, res) => {
         const item = row.getCell(1).value;
         const qty = Number(row.getCell(2).value);
         const rate = Number(row.getCell(3).value);
+        const note = row.getCell(4).value ? String(row.getCell(4).value).trim() : '';
         if (item && !isNaN(qty) && !isNaN(rate)) {
-          items.push({ item: String(item).trim(), quantity: qty, rate, unitPrice: qty > 0 ? rate / qty : 0, total: rate });
+          items.push({ item: String(item).trim(), quantity: qty, rate, unitPrice: qty > 0 ? rate / qty : 0, total: rate, note });
         }
       }
     });
