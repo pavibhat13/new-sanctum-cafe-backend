@@ -8,6 +8,7 @@ const configSchema = new mongoose.Schema({
   inventoryPeriodDays:   { type: Number, default: 7 },
   inventoryPeriodMode:   { type: String, enum: ['weekly','fortnightly','monthly','custom','manual'], default: 'custom' },
   inventoryAnchorDay:    { type: Number, default: 1 },
+  recoveryPhrase:        { type: String, default: '' },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Config', configSchema);

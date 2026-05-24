@@ -1041,7 +1041,7 @@ router.get('/config', requireOwner, async (req, res) => {
 
 router.put('/config', requireOwner, async (req, res) => {
   try {
-    const { cafeName, ownerEmail, ownerPin, staffPin, inventoryPeriodDays, inventoryPeriodMode, inventoryAnchorDay } = req.body;
+    const { cafeName, ownerEmail, ownerPin, staffPin, inventoryPeriodDays, inventoryPeriodMode, inventoryAnchorDay, recoveryPhrase } = req.body;
     let config = await Config.findOne();
     if (!config) config = new Config();
     if (cafeName !== undefined) config.cafeName = cafeName;
@@ -1051,6 +1051,7 @@ router.put('/config', requireOwner, async (req, res) => {
     if (inventoryPeriodDays !== undefined) config.inventoryPeriodDays = Math.max(1, Number(inventoryPeriodDays) || 7);
     if (inventoryPeriodMode !== undefined) config.inventoryPeriodMode = inventoryPeriodMode;
     if (inventoryAnchorDay !== undefined) config.inventoryAnchorDay = Number(inventoryAnchorDay);
+    if (recoveryPhrase !== undefined && recoveryPhrase.trim()) config.recoveryPhrase = recoveryPhrase.trim();
     res.json(await config.save());
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
@@ -1118,6 +1119,41 @@ router.get('/download-template', requireOwner, async (req, res) => {
       ].forEach(r => ws.addRow(r));
       const noteRow = ws.addRow(['← Item name', '← Food Raw Material / Vegetables / Flour/Other / Packaging / Other', '← Optional (e.g. dairy, spices)', '← Pkt, Kg, Bag, Ltr…', '← Stock at start of period', '← How much was used', '← Alert threshold']);
       noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+    } else if (type === 'vendors') {
+      ws.columns = [
+        { header: 'Name',       key: 'name',      width: 25 },
+        { header: 'Address',    key: 'address',   width: 30 },
+        { header: 'Phone',      key: 'phone',     width: 15 },
+        { header: 'Bank Name',  key: 'bankName',  width: 20 },
+        { header: 'Account No', key: 'accountNo', width: 20 },
+        { header: 'IFSC',       key: 'ifsc',      width: 15 },
+      ];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      [
+        ['Fresh Farms', '123 Market Road', '9876543210', 'SBI', '1234567890', 'SBIN0001234'],
+        ['Spice World',  '45 Gandhi Nagar',  '9123456789', '',   '',           ''           ],
+      ].forEach(r => ws.addRow(r));
+      const noteRow = ws.addRow(['← Vendor name (required)', '← Optional', '← Optional', '← Optional bank details', '← Optional', '← Optional']);
+      noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
+    } else if (type === 'expense-categories') {
+      ws.columns = [{ header: 'Expense Category', key: 'value', width: 35 }];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      ['Electricity', 'Water', 'Gas', 'Packaging Supplies', 'Maintenance'].forEach(v => ws.addRow([v]));
+      ws.addRow(['← Category name']).eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
+    } else if (type === 'cleaning-checklist') {
+      ws.columns = [{ header: 'Cleaning Checklist Item', key: 'value', width: 40 }];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      ['Dining tables cleaned', 'Floor mopped', 'Kitchen counter cleaned', 'Dustbin emptied', 'Washroom cleaned'].forEach(v => ws.addRow([v]));
+      ws.addRow(['← Checklist item name']).eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
+    } else if (type === 'mandatory-checklist') {
+      ws.columns = [{ header: 'Mandatory Checklist Item', key: 'value', width: 40 }];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      ['Gloves used', 'Apron worn', 'Storage clean', 'Expiry checked', 'Food covered properly'].forEach(v => ws.addRow([v]));
+      ws.addRow(['← Checklist item name']).eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
     } else {
       return res.status(400).json({ message: 'Unknown template type' });
     }
@@ -1325,9 +1361,9 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         data = await MasterValue.find({ type: 'Cleaning Checklist' }).sort({ value: 1 });
         columns = [{ header: 'Cleaning Checklist Item', key: 'value', width: 40 }];
         break;
-      case 'hygiene-checklist':
-        data = await MasterValue.find({ type: 'Hygiene Checklist' }).sort({ value: 1 });
-        columns = [{ header: 'Hygiene Checklist Item', key: 'value', width: 40 }];
+      case 'mandatory-checklist':
+        data = await MasterValue.find({ type: 'Mandatory Checklist' }).sort({ value: 1 });
+        columns = [{ header: 'Mandatory Checklist Item', key: 'value', width: 40 }];
         break;
       default:
         return res.status(400).json({ message: 'Invalid export type' });
@@ -1474,6 +1510,85 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
       }
     }
     res.json({ success: true, message: `${toAdd.length} added, ${toUpdate.length} updated`, addedCount: toAdd.length, updatedCount: toUpdate.length });
+  } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
+});
+
+// ── Vendors Bulk Upload ───────────────────────────────────────────────────────
+
+router.post('/vendors/bulk-upload', requireOwner, async (req, res) => {
+  try {
+    const { fileData } = req.body;
+    if (!fileData) return res.status(400).json({ message: 'No file data' });
+    const buffer = Buffer.from(fileData.split(',')[1] || fileData, 'base64');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+    let added = 0, updated = 0, skipped = 0;
+    const rows = [];
+    ws.eachRow((row, n) => {
+      if (n === 1) return;
+      const name = String(row.getCell(1).value || '').trim();
+      if (!name) return;
+      rows.push({
+        name,
+        address:   String(row.getCell(2).value || '').trim(),
+        phone:     String(row.getCell(3).value || '').trim(),
+        bankName:  String(row.getCell(4).value || '').trim(),
+        accountNo: String(row.getCell(5).value || '').trim(),
+        ifsc:      String(row.getCell(6).value || '').trim(),
+      });
+    });
+    for (const r of rows) {
+      const existing = await Vendor.findOne({ name: { $regex: new RegExp(`^${r.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } });
+      if (existing) {
+        if (r.address) existing.address = r.address;
+        if (r.phone) existing.phone = r.phone;
+        if (r.bankName) existing.bankName = r.bankName;
+        if (r.accountNo) existing.accountNo = r.accountNo;
+        if (r.ifsc) existing.ifsc = r.ifsc;
+        await existing.save();
+        updated++;
+      } else {
+        await new Vendor(r).save();
+        added++;
+      }
+    }
+    res.json({ success: true, message: `${added} added, ${updated} updated`, addedCount: added, updatedCount: updated });
+  } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
+});
+
+// ── Master Values Bulk Upload ─────────────────────────────────────────────────
+
+const MASTER_VALUE_TYPE_MAP = {
+  'expense-categories': 'Expense Category',
+  'cleaning-checklist': 'Cleaning Checklist',
+  'mandatory-checklist': 'Mandatory Checklist',
+};
+
+router.post('/master-values/bulk-upload', requireOwner, async (req, res) => {
+  try {
+    const { fileData, type } = req.body;
+    if (!fileData) return res.status(400).json({ message: 'No file data' });
+    const masterType = MASTER_VALUE_TYPE_MAP[type];
+    if (!masterType) return res.status(400).json({ message: 'Invalid type' });
+    const buffer = Buffer.from(fileData.split(',')[1] || fileData, 'base64');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+    let added = 0, skipped = 0;
+    const rows = [];
+    ws.eachRow((row, n) => {
+      if (n === 1) return;
+      const value = String(row.getCell(1).value || '').trim();
+      if (value) rows.push(value);
+    });
+    for (const value of rows) {
+      const exists = await MasterValue.findOne({ type: masterType, value: { $regex: new RegExp(`^${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } });
+      if (exists) { skipped++; continue; }
+      await new MasterValue({ type: masterType, value }).save();
+      added++;
+    }
+    res.json({ success: true, message: `${added} added, ${skipped} already existed`, addedCount: added, skippedCount: skipped });
   } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
 });
 

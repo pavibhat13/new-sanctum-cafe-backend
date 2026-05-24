@@ -34,6 +34,29 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/recover', async (req, res) => {
+  try {
+    const { email, recoveryPhrase } = req.body;
+    if (!email || !recoveryPhrase) {
+      return res.status(400).json({ message: 'Email and recovery phrase are required' });
+    }
+    const config = await Config.findOne();
+    if (!config?.ownerEmail || !config?.recoveryPhrase) {
+      return res.status(401).json({ message: 'Recovery is not set up. Ask your administrator to configure it in Settings.' });
+    }
+    if (
+      email.trim().toLowerCase() !== config.ownerEmail.trim().toLowerCase() ||
+      recoveryPhrase !== config.recoveryPhrase
+    ) {
+      return res.status(401).json({ message: 'Invalid email or recovery phrase' });
+    }
+    const token = generateToken('owner');
+    res.json({ token, role: 'owner', cafeName: config.cafeName });
+  } catch (error) {
+    res.status(500).json({ message: 'Recovery failed' });
+  }
+});
+
 router.get('/verify', authenticateToken, async (req, res) => {
   try {
     const config = await Config.findOne();
