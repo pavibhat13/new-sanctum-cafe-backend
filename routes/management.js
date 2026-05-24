@@ -30,14 +30,42 @@ const getDateRangeQuery = (fromDate, toDate) => {
   return q;
 };
 
+const computeCloseDate = (periodStart, config) => {
+  const mode = config?.inventoryPeriodMode || 'custom';
+  const start = new Date(periodStart); start.setHours(0, 0, 0, 0);
+  switch (mode) {
+    case 'weekly': {
+      const anchorDay = config?.inventoryAnchorDay ?? 1;
+      const earliest = new Date(start); earliest.setDate(earliest.getDate() + 7);
+      while (earliest.getDay() !== anchorDay) earliest.setDate(earliest.getDate() + 1);
+      return earliest;
+    }
+    case 'fortnightly': {
+      const anchorDay = config?.inventoryAnchorDay ?? 1;
+      const earliest = new Date(start); earliest.setDate(earliest.getDate() + 14);
+      while (earliest.getDay() !== anchorDay) earliest.setDate(earliest.getDate() + 1);
+      return earliest;
+    }
+    case 'monthly': {
+      const closeDay = Math.min(config?.inventoryAnchorDay ?? 1, 28);
+      return new Date(start.getFullYear(), start.getMonth() + 1, closeDay);
+    }
+    case 'custom': {
+      const days = config?.inventoryPeriodDays || 7;
+      const d = new Date(start); d.setDate(d.getDate() + days);
+      return d;
+    }
+    case 'manual': default: return null;
+  }
+};
+
 // Returns the current open InventoryPeriod, creating one on first use.
 // On first creation, seeds period items from legacy ManagementInventory stock fields
 // (still present in MongoDB even after schema update).
 const autoClosePeriodIfExpired = async (period) => {
   const config = await Config.findOne();
-  const periodDays = config?.inventoryPeriodDays || 7;
-  const ageDays = (Date.now() - new Date(period.periodStart).getTime()) / (1000 * 60 * 60 * 24);
-  if (ageDays < periodDays) return period;
+  const closeDate = computeCloseDate(period.periodStart, config);
+  if (!closeDate || new Date() < closeDate) return period;
 
   const now = new Date();
   period.status = 'closed';
@@ -513,7 +541,7 @@ router.delete('/checklists/:id', requireOwner, async (req, res) => {
 // Returns { period, items } — items are master fields joined with current period stock
 router.get('/inventory', async (req, res) => {
   try {
-    const period = await getOrCreateCurrentPeriod();
+    const [period, config] = await Promise.all([getOrCreateCurrentPeriod(), Config.findOne()]);
     const [masters, periodItems] = await Promise.all([
       ManagementInventory.find().sort({ category: 1, item: 1 }),
       InventoryPeriodItem.find({ periodId: period._id }),
@@ -538,7 +566,9 @@ router.get('/inventory', async (req, res) => {
         periodItemId: pi._id,
       };
     });
-    res.json({ period, items });
+    const nextCloseDate = computeCloseDate(period.periodStart, config);
+    const periodWithClose = { ...period.toObject(), nextCloseDate: nextCloseDate || null };
+    res.json({ period: periodWithClose, items });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -839,7 +869,10 @@ router.get('/reports', requireOwner, async (req, res) => {
       PurchaseHeader.aggregate([{ $match: dq }, { $group: { _id: null, totalPurchases: { $sum: '$totalAmount' } } }]),
       Expense.aggregate([{ $match: dq }, { $group: { _id: null, totalExpenses: { $sum: '$amount' } } }]),
       OnlineSettlement.aggregate([{ $match: dqPay }, { $group: { _id: null, totalCharges: { $sum: '$charges' }, totalReceived: { $sum: '$payoutReceived' }, totalGrossSales: { $sum: '$grossSales' } } }]),
-      Salary.aggregate([{ $match: dq }, { $group: { _id: null, totalSalaries: { $sum: '$amount' } } }]),
+      Salary.aggregate([
+        { $match: { fromDate: { $gte: start, $lte: end } } },
+        { $group: { _id: null, totalSalaries: { $sum: { $cond: [{ $eq: ['$type', 'Salary'] }, '$netPay', '$amount'] } } } },
+      ]),
     ]);
 
     res.json({
@@ -1008,7 +1041,7 @@ router.get('/config', requireOwner, async (req, res) => {
 
 router.put('/config', requireOwner, async (req, res) => {
   try {
-    const { cafeName, ownerEmail, ownerPin, staffPin, inventoryPeriodDays } = req.body;
+    const { cafeName, ownerEmail, ownerPin, staffPin, inventoryPeriodDays, inventoryPeriodMode, inventoryAnchorDay } = req.body;
     let config = await Config.findOne();
     if (!config) config = new Config();
     if (cafeName !== undefined) config.cafeName = cafeName;
@@ -1016,6 +1049,8 @@ router.put('/config', requireOwner, async (req, res) => {
     if (ownerPin !== undefined && ownerPin.trim()) config.ownerPin = ownerPin;
     if (staffPin !== undefined && staffPin.trim()) config.staffPin = staffPin;
     if (inventoryPeriodDays !== undefined) config.inventoryPeriodDays = Math.max(1, Number(inventoryPeriodDays) || 7);
+    if (inventoryPeriodMode !== undefined) config.inventoryPeriodMode = inventoryPeriodMode;
+    if (inventoryAnchorDay !== undefined) config.inventoryAnchorDay = Number(inventoryAnchorDay);
     res.json(await config.save());
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
@@ -1271,6 +1306,29 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         await wb.xlsx.write(res);
         return res.end();
       }
+      case 'vendors':
+        data = await Vendor.find().sort({ name: 1 });
+        columns = [
+          { header: 'Name', key: 'name', width: 25 },
+          { header: 'Address', key: 'address', width: 30 },
+          { header: 'Phone', key: 'phone', width: 15 },
+          { header: 'Bank Name', key: 'bankName', width: 20 },
+          { header: 'Account No', key: 'accountNo', width: 20 },
+          { header: 'IFSC', key: 'ifsc', width: 15 },
+        ];
+        break;
+      case 'expense-categories':
+        data = await MasterValue.find({ type: 'Expense Category' }).sort({ value: 1 });
+        columns = [{ header: 'Expense Category', key: 'value', width: 30 }];
+        break;
+      case 'cleaning-checklist':
+        data = await MasterValue.find({ type: 'Cleaning Checklist' }).sort({ value: 1 });
+        columns = [{ header: 'Cleaning Checklist Item', key: 'value', width: 40 }];
+        break;
+      case 'hygiene-checklist':
+        data = await MasterValue.find({ type: 'Hygiene Checklist' }).sort({ value: 1 });
+        columns = [{ header: 'Hygiene Checklist Item', key: 'value', width: 40 }];
+        break;
       default:
         return res.status(400).json({ message: 'Invalid export type' });
     }
