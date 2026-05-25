@@ -538,6 +538,18 @@ router.delete('/checklists/:id', requireOwner, async (req, res) => {
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
 
+router.get('/inventory-categories', async (req, res) => {
+  try {
+    let cats = await MasterValue.find({ type: 'Inventory Category' }).sort({ value: 1 });
+    if (cats.length === 0) {
+      const defaults = ['Food Raw Material', 'Vegetables', 'Flour/Other', 'Packaging', 'Other'];
+      cats = await MasterValue.insertMany(defaults.map(value => ({ type: 'Inventory Category', value })));
+    }
+    const subCats = await MasterValue.find({ type: 'Inventory Sub Category' }).sort({ value: 1 });
+    res.json({ categories: cats, subCategories: subCats });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
 // Returns { period, items } — items are master fields joined with current period stock
 router.get('/inventory', async (req, res) => {
   try {
@@ -1449,7 +1461,10 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(buffer);
     const ws = wb.getWorksheet(1);
-    const allowed = ['Food Raw Material', 'Vegetables', 'Flour/Other', 'Packaging', 'Other'];
+    const catDocs = await MasterValue.find({ type: 'Inventory Category' });
+    const allowed = catDocs.length
+      ? catDocs.map(c => c.value)
+      : ['Food Raw Material', 'Vegetables', 'Flour/Other', 'Packaging', 'Other'];
     const existing = await ManagementInventory.find({});
     const existingMap = {};
     existing.forEach(i => { existingMap[normalizeItemName(i.item)] = i; });

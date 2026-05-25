@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const masterValueSchema = new mongoose.Schema({
   type: {
     type: String,
-    enum: ['Expense Category', 'Payment Method', 'Cleaning Checklist', 'Mandatory Checklist', 'Employee'],
+    enum: ['Expense Category', 'Payment Method', 'Cleaning Checklist', 'Mandatory Checklist', 'Employee', 'Inventory Category', 'Inventory Sub Category'],
     required: true,
   },
   value:          { type: String, required: true, trim: true },
