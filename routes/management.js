@@ -15,6 +15,7 @@ const InventoryPeriod = require('../models/InventoryPeriod');
 const InventoryPeriodItem = require('../models/InventoryPeriodItem');
 const Config = require('../models/Config');
 const StaffLeave = require('../models/StaffLeave');
+const ItemAlias = require('../models/ItemAlias');
 const { authenticateToken, requireOwner } = require('../middleware/auth');
 
 router.use(authenticateToken);
@@ -122,22 +123,35 @@ const getOrCreateCurrentPeriod = async () => {
   }
 };
 
-const updateInventoryStock = async (itemName, quantityChange, role) => {
+const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const resolveItemAlias = async (itemName) => {
+  const alias = await ItemAlias.findOne({ rawItem: { $regex: new RegExp(`^${safeEscape(itemName.trim())}$`, 'i') } });
+  if (alias) return alias.generalItem;
+  // fallback: normalized match
   const normInput = normalizeItemName(itemName);
+  const all = await ItemAlias.find({});
+  const normAlias = all.find(a => normalizeItemName(a.rawItem) === normInput);
+  return normAlias ? normAlias.generalItem : itemName;
+};
+
+const updateInventoryStock = async (itemName, quantityChange, role) => {
+  const resolvedName = await resolveItemAlias(itemName);
+  const normInput = normalizeItemName(resolvedName);
   const period = await getOrCreateCurrentPeriod();
 
   // Resolve canonical name from master
   const allMasters = await ManagementInventory.find({});
   const master = allMasters.find(m => normalizeItemName(m.item) === normInput);
-  const canonicalName = master ? master.item : itemName;
+  const canonicalName = master ? master.item : resolvedName;
 
-  // Auto-create master for new items coming from purchase lines
+  let wasAutoCreated = false;
   if (!master && quantityChange > 0) {
-    await new ManagementInventory({ item: itemName, category: 'Other', unit: 'Pkt', createdBy: role }).save();
+    await new ManagementInventory({ item: resolvedName, category: 'Other', unit: 'Pkt', createdBy: role }).save();
+    wasAutoCreated = true;
   }
 
   // Find or create period item
-  const safeEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   let pi = await InventoryPeriodItem.findOne({
     periodId: period._id,
     item: { $regex: new RegExp(`^${safeEscape(canonicalName.trim())}$`, 'i') },
@@ -146,6 +160,7 @@ const updateInventoryStock = async (itemName, quantityChange, role) => {
   pi.purchasedQty = (pi.purchasedQty || 0) + quantityChange;
   pi.closingStock = (pi.openingStock || 0) + pi.purchasedQty - (pi.usedQty || 0);
   await pi.save();
+  return { wasAutoCreated, canonicalName };
 };
 
 // ── Daily Sales ──────────────────────────────────────────────────────────────
@@ -268,12 +283,18 @@ router.post('/purchase-lines', requireOwner, async (req, res) => {
   try {
     const newLines = Array.isArray(req.body) ? req.body : [req.body];
     const saved = [];
+    const autoCreated = [];
     for (const d of newLines) {
       const line = await new PurchaseLine({ ...d, createdBy: req.user.role }).save();
-      await updateInventoryStock(line.item, line.quantity, req.user.role);
+      const result = await updateInventoryStock(line.item, line.quantity, req.user.role);
+      if (result.wasAutoCreated) autoCreated.push(result.canonicalName);
       saved.push(line);
     }
-    res.status(201).json(saved);
+    const data = saved.length === 1 ? saved[0] : saved;
+    if (autoCreated.length > 0) {
+      return res.status(201).json({ data, autoCreated, warning: `${autoCreated.length} new item(s) were auto-created in Inventory Masters with default values (Category: Other, Unit: Pkt): ${autoCreated.join(', ')}. Please update them in Masters → Inventory Items.` });
+    }
+    res.status(201).json(data);
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
 
@@ -800,9 +821,15 @@ router.post('/staff-purchase', async (req, res) => {
       createdBy: req.user.role,
     }).save();
 
-    await updateInventoryStock(line.item, line.quantity, req.user.role);
+    const stockResult = await updateInventoryStock(line.item, line.quantity, req.user.role);
 
-    res.status(201).json({ header, line });
+    res.status(201).json({
+      header, line,
+      ...(stockResult.wasAutoCreated && {
+        autoCreated: [stockResult.canonicalName],
+        warning: `"${stockResult.canonicalName}" was auto-created in Inventory Masters with default values (Category: Other, Unit: Pkt). Please update it in Masters → Inventory Items and also in Masters → Item Aliases.`,
+      }),
+    });
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
 
@@ -1166,6 +1193,21 @@ router.get('/download-template', requireOwner, async (req, res) => {
       ['Gloves used', 'Apron worn', 'Storage clean', 'Expiry checked', 'Food covered properly'].forEach(v => ws.addRow([v]));
       ws.addRow(['← Checklist item name']).eachCell(c => { c.fill = noteFill; c.font = noteFont; });
 
+    } else if (type === 'item-aliases') {
+      ws.columns = [
+        { header: 'Raw Item (Vendor / Invoice Name)', key: 'rawItem',     width: 42 },
+        { header: 'General Item (Kitchen / Inventory Name)', key: 'generalItem', width: 42 },
+      ];
+      ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+      [
+        ['250ml Disp.Cups',              'Milkshake Cup Small'],
+        ['Hyfun Potato Hashbrown',       'Aloo Tikki'],
+        ['FRENCH FRIES ( AMUL ) 2.5 KG','French Fries'],
+        ['Eggless Mayonnaise 1 KG',      'White Mayonnaise'],
+        ['Kannan Paneer 1 KG',           'Paneer'],
+      ].forEach(r => ws.addRow(r));
+      ws.addRow(['← Exactly as it appears on the invoice', '← Exactly as named in Inventory']).eachCell(c => { c.fill = noteFill; c.font = noteFont; });
+
     } else {
       return res.status(400).json({ message: 'Unknown template type' });
     }
@@ -1377,6 +1419,13 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         data = await MasterValue.find({ type: 'Mandatory Checklist' }).sort({ value: 1 });
         columns = [{ header: 'Mandatory Checklist Item', key: 'value', width: 40 }];
         break;
+      case 'item-aliases':
+        data = await ItemAlias.find().sort({ rawItem: 1 });
+        columns = [
+          { header: 'Raw Item (Vendor Name)', key: 'rawItem', width: 42 },
+          { header: 'General Item (Inventory Name)', key: 'generalItem', width: 42 },
+        ];
+        break;
       default:
         return res.status(400).json({ message: 'Invalid export type' });
     }
@@ -1442,12 +1491,22 @@ router.post('/confirm-invoice', requireOwner, async (req, res) => {
       return res.status(400).json({ message: `Bill amount (${header.totalAmount}) ≠ items total (${linesTotal.toFixed(2)})` });
     }
     const created = [];
+    const autoCreated = [];
     for (const d of items) {
       const line = await new PurchaseLine({ purchaseHeader: purchaseHeaderId, ...d, createdBy: req.user.role }).save();
-      await updateInventoryStock(d.item, d.quantity, req.user.role);
+      const result = await updateInventoryStock(d.item, d.quantity, req.user.role);
+      if (result.wasAutoCreated) autoCreated.push(result.canonicalName);
       created.push(line);
     }
-    res.json({ success: true, message: `${created.length} items saved`, data: created });
+    res.json({
+      success: true,
+      message: `${created.length} items saved`,
+      data: created,
+      ...(autoCreated.length > 0 && {
+        autoCreated,
+        warning: `${autoCreated.length} new item(s) were auto-created in Inventory Masters with default values (Category: Other, Unit: Pkt): ${autoCreated.join(', ')}. Please update them in Masters → Inventory Items.`,
+      }),
+    });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -1604,6 +1663,78 @@ router.post('/master-values/bulk-upload', requireOwner, async (req, res) => {
       added++;
     }
     res.json({ success: true, message: `${added} added, ${skipped} already existed`, addedCount: added, skippedCount: skipped });
+  } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
+});
+
+// ── Item Aliases ──────────────────────────────────────────────────────────────
+
+router.get('/item-aliases', requireOwner, async (req, res) => {
+  try { res.json(await ItemAlias.find().sort({ rawItem: 1 })); }
+  catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/item-aliases', requireOwner, async (req, res) => {
+  try {
+    const { rawItem, generalItem } = req.body;
+    if (!rawItem?.trim() || !generalItem?.trim()) return res.status(400).json({ message: 'Both raw item and general item are required' });
+    const alias = await new ItemAlias({ rawItem: rawItem.trim(), generalItem: generalItem.trim() }).save();
+    res.status(201).json(alias);
+  } catch (e) {
+    if (e.code === 11000) return res.status(400).json({ message: 'This raw item already has an alias' });
+    res.status(400).json({ message: e.message });
+  }
+});
+
+router.put('/item-aliases/:id', requireOwner, async (req, res) => {
+  try {
+    const { rawItem, generalItem } = req.body;
+    const alias = await ItemAlias.findByIdAndUpdate(
+      req.params.id,
+      { rawItem: rawItem?.trim(), generalItem: generalItem?.trim() },
+      { new: true, runValidators: true }
+    );
+    if (!alias) return res.status(404).json({ message: 'Not found' });
+    res.json(alias);
+  } catch (e) {
+    if (e.code === 11000) return res.status(400).json({ message: 'This raw item already has an alias' });
+    res.status(400).json({ message: e.message });
+  }
+});
+
+router.delete('/item-aliases/:id', requireOwner, async (req, res) => {
+  try {
+    await ItemAlias.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Deleted' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/item-aliases/bulk-upload', requireOwner, async (req, res) => {
+  try {
+    const { fileData } = req.body;
+    if (!fileData) return res.status(400).json({ message: 'No file data' });
+    const buffer = Buffer.from(fileData.split(',')[1] || fileData, 'base64');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+    let added = 0, updated = 0, skipped = 0;
+    const rows = [];
+    ws.eachRow((row, n) => {
+      if (n === 1) return;
+      const rawItem    = String(row.getCell(1).value || '').trim();
+      const generalItem = String(row.getCell(2).value || '').trim();
+      if (rawItem && generalItem) rows.push({ rawItem, generalItem });
+    });
+    for (const { rawItem, generalItem } of rows) {
+      const existing = await ItemAlias.findOne({ rawItem: { $regex: new RegExp(`^${safeEscape(rawItem)}$`, 'i') } });
+      if (existing) {
+        if (existing.generalItem.toLowerCase() !== generalItem.toLowerCase()) {
+          existing.generalItem = generalItem; await existing.save(); updated++;
+        } else { skipped++; }
+      } else {
+        await new ItemAlias({ rawItem, generalItem }).save(); added++;
+      }
+    }
+    res.json({ success: true, message: `${added} added, ${updated} updated, ${skipped} unchanged` });
   } catch (e) { res.status(500).json({ message: 'Bulk upload failed: ' + e.message }); }
 });
 
