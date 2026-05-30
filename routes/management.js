@@ -249,6 +249,10 @@ router.delete('/purchase-headers/:id', requireOwner, async (req, res) => {
   try {
     const header = await PurchaseHeader.findByIdAndDelete(req.params.id);
     if (!header) return res.status(404).json({ message: 'Not found' });
+    const lines = await PurchaseLine.find({ purchaseHeader: req.params.id });
+    for (const line of lines) {
+      await updateInventoryStock(line.item, -line.quantity, req.user.role);
+    }
     await PurchaseLine.deleteMany({ purchaseHeader: req.params.id });
     res.json({ message: 'Deleted with associated lines' });
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -1249,10 +1253,45 @@ router.get('/export-excel', requireOwner, async (req, res) => {
         data = await PurchaseHeader.find(query).sort({ date: -1 });
         columns = [{ header: 'Date', key: 'date', width: 15 }, { header: 'Bill No', key: 'billNo', width: 15 }, { header: 'Vendor', key: 'vendor', width: 25 }, { header: 'Total Amount', key: 'totalAmount', width: 15 }, { header: 'Payment Method', key: 'paymentMethod', width: 20 }];
         break;
-      case 'inventory':
-        data = await ManagementInventory.find().sort({ category: 1, item: 1 });
-        columns = [{ header: 'Item', key: 'item', width: 25 }, { header: 'Category', key: 'category', width: 20 }, { header: 'Unit', key: 'unit', width: 10 }, { header: 'Opening', key: 'openingStock', width: 10 }, { header: 'Purchased', key: 'purchasedQty', width: 10 }, { header: 'Used', key: 'usedQty', width: 10 }, { header: 'Closing', key: 'closingStock', width: 10 }, { header: 'Threshold', key: 'threshold', width: 10 }];
-        break;
+      case 'inventory': {
+        const [masters, currentPeriod] = await Promise.all([
+          ManagementInventory.find().sort({ category: 1, item: 1 }),
+          InventoryPeriod.findOne({ status: 'open' }, null, { sort: { periodStart: -1 } }),
+        ]);
+        const periodItems = currentPeriod
+          ? await InventoryPeriodItem.find({ periodId: currentPeriod._id })
+          : [];
+        const piMap = {};
+        periodItems.forEach(pi => { piMap[normalizeItemName(pi.item)] = pi; });
+        ws.columns = [
+          { header: 'Item', key: 'item', width: 25 },
+          { header: 'Category', key: 'category', width: 20 },
+          { header: 'Sub Category', key: 'subCategory', width: 18 },
+          { header: 'Unit', key: 'unit', width: 10 },
+          { header: 'Opening', key: 'openingStock', width: 10 },
+          { header: 'Purchased', key: 'purchasedQty', width: 10 },
+          { header: 'Used', key: 'usedQty', width: 10 },
+          { header: 'Closing', key: 'closingStock', width: 10 },
+          { header: 'Threshold', key: 'threshold', width: 10 },
+        ];
+        masters.forEach(m => {
+          const pi = piMap[normalizeItemName(m.item)] || {};
+          ws.addRow({
+            item: m.item, category: m.category, subCategory: m.subCategory || '', unit: m.unit,
+            openingStock: pi.openingStock ?? 0,
+            purchasedQty: pi.purchasedQty ?? 0,
+            usedQty: pi.usedQty ?? 0,
+            closingStock: pi.closingStock ?? 0,
+            threshold: m.threshold ?? 0,
+          });
+        });
+        ws.getRow(1).font = { bold: true };
+        ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=inventory-${new Date().toISOString().split('T')[0]}.xlsx`);
+        await wb.xlsx.write(res);
+        return res.end();
+      }
       case 'salaries':
         data = await Salary.find(query).sort({ date: -1 });
         columns = [{ header: 'Date', key: 'date', width: 15 }, { header: 'Employee', key: 'employeeName', width: 20 }, { header: 'Amount', key: 'amount', width: 12 }, { header: 'Type', key: 'type', width: 15 }, { header: 'Payment Method', key: 'paymentMethod', width: 15 }, { header: 'Notes', key: 'notes', width: 30 }];
