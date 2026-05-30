@@ -1830,4 +1830,64 @@ router.delete('/staff-leaves/:id', requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
+// ── Backup & Restore ──────────────────────────────────────────────────────────
+
+const BACKUP_COLLECTIONS = [
+  { key: 'dailySales',           model: DailySales },
+  { key: 'purchaseHeaders',      model: PurchaseHeader },
+  { key: 'purchaseLines',        model: PurchaseLine },
+  { key: 'onlineSettlements',    model: OnlineSettlement },
+  { key: 'expenses',             model: Expense },
+  { key: 'salaries',             model: Salary },
+  { key: 'inventory',            model: ManagementInventory },
+  { key: 'inventoryPeriods',     model: InventoryPeriod },
+  { key: 'inventoryPeriodItems', model: InventoryPeriodItem },
+  { key: 'vendors',              model: Vendor },
+  { key: 'masterValues',         model: MasterValue },
+  { key: 'itemAliases',          model: ItemAlias },
+  { key: 'config',               model: Config },
+  { key: 'checklistLogs',        model: ChecklistLog },
+  { key: 'staffLeaves',          model: StaffLeave },
+];
+
+router.get('/backup', requireOwner, async (req, res) => {
+  try {
+    const collections = {};
+    for (const { key, model } of BACKUP_COLLECTIONS) {
+      collections[key] = await model.find().lean();
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=sanctum-backup-${new Date().toISOString().split('T')[0]}.json`);
+    res.json({ version: 1, exportedAt: new Date().toISOString(), collections });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+router.post('/restore', requireOwner, async (req, res) => {
+  try {
+    const { collections } = req.body;
+    if (!collections) return res.status(400).json({ message: 'No collections data provided' });
+    const results = {};
+    for (const { key, model } of BACKUP_COLLECTIONS) {
+      const docs = collections[key];
+      if (!Array.isArray(docs) || docs.length === 0) {
+        results[key] = { total: 0, inserted: 0, skipped: 0 };
+        continue;
+      }
+      let inserted = 0;
+      try {
+        const r = await model.insertMany(docs, { ordered: false });
+        inserted = r.length;
+      } catch (e) {
+        if (e.code === 11000 || e.name === 'MongoBulkWriteError') {
+          inserted = e.insertedDocs?.length ?? 0;
+        } else {
+          throw e;
+        }
+      }
+      results[key] = { total: docs.length, inserted, skipped: docs.length - inserted };
+    }
+    res.json({ success: true, results });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
 module.exports = router;
