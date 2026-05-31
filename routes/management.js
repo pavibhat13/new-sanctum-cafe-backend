@@ -1116,15 +1116,22 @@ router.get('/download-template', requireOwner, async (req, res) => {
 
     if (type === 'invoice') {
       ws.columns = [
-        { header: 'Item', key: 'item', width: 30 },
-        { header: 'Qty', key: 'qty', width: 12 },
-        { header: 'Total Amount (₹)', key: 'total', width: 20 },
-        { header: 'Note', key: 'note', width: 28 },
+        { header: 'Date',       key: 'date',      width: 14 },
+        { header: 'Bill No',    key: 'billNo',    width: 14 },
+        { header: 'Vendor',     key: 'vendor',    width: 28 },
+        { header: 'Item',       key: 'item',      width: 32 },
+        { header: 'Quantity',   key: 'quantity',  width: 12 },
+        { header: 'Unit Price', key: 'unitPrice', width: 14 },
+        { header: 'Total',      key: 'total',     width: 14 },
+        { header: 'Note',       key: 'note',      width: 28 },
       ];
       ws.getRow(1).eachCell(c => { c.fill = headerFill; c.font = headerFont; });
-      const samples = [['Onion', 5.5, 100, ''], ['Tomato', 3, 60, ''], ['Mozzarella Cheese', 2, 500, 'Exp: Dec 2026']];
-      samples.forEach(r => ws.addRow(r));
-      const noteRow = ws.addRow(['← Item name (text)', '← Quantity', '← Total cost for this line (not unit price). Grand total must match bill amount.', '← Optional note (expiry, batch no…)']);
+      [
+        ['1/6/2026', '2052', "Manish's Smart Buy", 'Dur Mushrooms 200g', 4, 45, 180, ''],
+        ['1/6/2026', '2052', "Manish's Smart Buy", 'NOODLES 1 KG PKT 001', 5, 90, 450, ''],
+        ['1/6/2026', '2052', "Manish's Smart Buy", 'Mozzarella Cheese', 2, 900, 1800, 'Exp: Dec 2026'],
+      ].forEach(r => ws.addRow(r));
+      const noteRow = ws.addRow(['← Date (dd/mm/yyyy)', '← Bill/invoice number', '← Vendor name', '← Item name', '← Quantity', '← Unit price', '← Line total', '← Optional note']);
       noteRow.eachCell(c => { c.fill = noteFill; c.font = noteFont; });
 
     } else if (type === 'inventory-master') {
@@ -1549,6 +1556,66 @@ router.post('/confirm-invoice', requireOwner, async (req, res) => {
       }),
     });
   } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── Purchase Lines Bulk Import (from export format) ───────────────────────────
+
+router.post('/purchase-lines/bulk-import', requireOwner, async (req, res) => {
+  try {
+    const { fileData } = req.body;
+    if (!fileData) return res.status(400).json({ message: 'No file data' });
+    const buffer = Buffer.from(fileData.split(',')[1] || fileData, 'base64');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+
+    // Parse rows — columns: Date, Bill No, Vendor, Item, Quantity, Unit Price, Total, Note
+    const rowsByBill = {};
+    ws.eachRow((row, n) => {
+      if (n === 1) return; // header
+      const billNo = String(row.getCell(2).value || '').trim();
+      const item   = String(row.getCell(4).value || '').trim();
+      if (!billNo || !item) return;
+      const note = row.getCell(8).value ? String(row.getCell(8).value).trim() : '';
+      const rawDate = row.getCell(1).value;
+      const qty     = Number(row.getCell(5).value) || 0;
+      const unitP   = Number(row.getCell(6).value) || 0;
+      const total   = Number(row.getCell(7).value) || 0;
+      const vendor  = String(row.getCell(3).value || '').trim();
+      const date    = rawDate instanceof Date ? rawDate : new Date(rawDate);
+      if (!rowsByBill[billNo]) rowsByBill[billNo] = { vendor, date, lines: [] };
+      rowsByBill[billNo].lines.push({ item, quantity: qty, unitPrice: unitP, rate: total, note });
+    });
+
+    const results = [];
+    const autoCreated = [];
+
+    for (const [billNo, { vendor, date, lines }] of Object.entries(rowsByBill)) {
+      // Find or create purchase header
+      let header = await PurchaseHeader.findOne({ billNo });
+      if (!header) {
+        const totalAmount = lines.reduce((s, l) => s + l.rate, 0);
+        header = await new PurchaseHeader({ billNo, vendor, date, totalAmount, createdBy: req.user.role }).save();
+      }
+
+      let inserted = 0, skipped = 0;
+      for (const d of lines) {
+        const exists = await PurchaseLine.findOne({ purchaseHeader: header._id, item: new RegExp(`^${safeEscape(d.item)}$`, 'i') });
+        if (exists) { skipped++; continue; }
+        await new PurchaseLine({ purchaseHeader: header._id, ...d, createdBy: req.user.role }).save();
+        const result = await updateInventoryStock(d.item, d.quantity, req.user.role);
+        if (result.wasAutoCreated) autoCreated.push(result.canonicalName);
+        inserted++;
+      }
+      results.push({ billNo, vendor, total: lines.length, inserted, skipped });
+    }
+
+    res.json({
+      success: true,
+      results,
+      ...(autoCreated.length > 0 && { warning: `${autoCreated.length} item(s) auto-created in Inventory Masters: ${autoCreated.join(', ')}` }),
+    });
+  } catch (e) { res.status(500).json({ message: 'Import failed: ' + e.message }); }
 });
 
 // ── Inventory Bulk Upload ─────────────────────────────────────────────────────
