@@ -279,7 +279,7 @@ router.get('/purchase-lines', requireOwner, async (req, res) => {
         query.purchaseHeader = { $in: ids };
       }
     }
-    res.json(await PurchaseLine.find(query).populate('purchaseHeader', 'billNo vendor date').sort({ createdAt: -1 }));
+    res.json(await PurchaseLine.find(query).populate('purchaseHeader', 'billNo vendor date totalAmount').sort({ createdAt: -1 }));
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
