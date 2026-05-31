@@ -675,9 +675,10 @@ router.put('/inventory/threshold', requireOwner, async (req, res) => {
     const { item, threshold } = req.body;
     const inv = await ManagementInventory.findOneAndUpdate(
       { item: { $regex: new RegExp(`^${item.trim()}$`, 'i') } },
-      { threshold },
-      { new: true, upsert: true }
+      { $set: { threshold: Number(threshold) || 0 } },
+      { new: true }
     );
+    if (!inv) return res.status(404).json({ message: 'Item not found' });
     res.json(inv);
   } catch (e) { res.status(400).json({ message: e.message }); }
 });
