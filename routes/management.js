@@ -21,7 +21,7 @@ const { authenticateToken, requireOwner } = require('../middleware/auth');
 router.use(authenticateToken);
 
 const normalizeItemName = (name) =>
-  name.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1');
+  (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const getDateRangeQuery = (fromDate, toDate) => {
   if (!fromDate && !toDate) return null;
@@ -905,13 +905,15 @@ router.get('/reports', requireOwner, async (req, res) => {
     const start = new Date(fromDate); start.setHours(0, 0, 0, 0);
     const end = new Date(toDate); end.setHours(23, 59, 59, 999);
     const dq = { date: { $gte: start, $lte: end } };
-    const dqPay = { paymentDate: { $gte: start, $lte: end } };
+    // Match settlements whose sales period overlaps the report range (not payment date,
+    // which can arrive months later and would cause charges/sales to fall in different periods).
+    const dqSettle = { fromDate: { $lte: end }, toDate: { $gte: start } };
 
     const [salesAgg, purchaseAgg, expenseAgg, settlementAgg, salaryAgg] = await Promise.all([
       DailySales.aggregate([{ $match: dq }, { $group: { _id: null, totalSales: { $sum: '$total' }, cashSales: { $sum: '$cash' }, upiSales: { $sum: '$upi' }, swiggySales: { $sum: '$swiggy' }, zomatoSales: { $sum: '$zomato' } } }]),
       PurchaseHeader.aggregate([{ $match: dq }, { $group: { _id: null, totalPurchases: { $sum: '$totalAmount' } } }]),
       Expense.aggregate([{ $match: dq }, { $group: { _id: null, totalExpenses: { $sum: '$amount' } } }]),
-      OnlineSettlement.aggregate([{ $match: dqPay }, { $group: { _id: null, totalCharges: { $sum: '$charges' }, totalReceived: { $sum: '$payoutReceived' }, totalGrossSales: { $sum: '$grossSales' } } }]),
+      OnlineSettlement.aggregate([{ $match: dqSettle }, { $group: { _id: null, totalCharges: { $sum: '$charges' }, totalReceived: { $sum: '$payoutReceived' }, totalGrossSales: { $sum: '$grossSales' } } }]),
       Salary.aggregate([
         { $match: { fromDate: { $gte: start, $lte: end } } },
         { $group: { _id: null, totalSalaries: { $sum: { $cond: [{ $eq: ['$type', 'Salary'] }, '$netPay', '$amount'] } } } },
@@ -1567,6 +1569,7 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
     const existingMap = {};
     existing.forEach(i => { existingMap[normalizeItemName(i.item)] = i; });
     const toAdd = [], toUpdate = [];
+    const addedKeys = new Set();
     ws.eachRow((row, n) => {
       if (n > 1) {
         const name = row.getCell(1).value;
@@ -1586,10 +1589,10 @@ router.post('/inventory/bulk-upload', requireOwner, async (req, res) => {
           const normKey = normalizeItemName(nm);
           if (existingMap[normKey]) {
             toUpdate.push({ doc: existingMap[normKey], cat, subCategory, unit, openingStock, usedQty, threshold, hasStockCols });
-          } else {
+          } else if (!addedKeys.has(normKey)) {
             const closingStock = openingStock - usedQty;
             toAdd.push({ item: nm, category: allowed.includes(cat) ? cat : 'Other', subCategory, unit, openingStock, usedQty, closingStock, threshold, createdBy: req.user.role });
-            existingMap[normKey] = true;
+            addedKeys.add(normKey);
           }
         }
       }
