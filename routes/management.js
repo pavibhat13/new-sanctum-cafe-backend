@@ -869,10 +869,21 @@ router.get('/dashboard-stats', requireOwner, async (req, res) => {
     const settlementData = await OnlineSettlement.aggregate([{ $group: { _id: null, totalCharges: { $sum: '$charges' } } }]);
     const onlineCharges = settlementData.length ? settlementData[0].totalCharges : 0;
 
-    const lowStockItems = await ManagementInventory.find({
-      threshold: { $gt: 0 },
-      $expr: { $lte: ['$closingStock', '$threshold'] },
-    });
+    const openPeriod = await InventoryPeriod.findOne({ status: 'open' });
+    let lowStockItems = [];
+    if (openPeriod) {
+      const [masters, periodItems] = await Promise.all([
+        ManagementInventory.find({ threshold: { $gt: 0 } }),
+        InventoryPeriodItem.find({ periodId: openPeriod._id }),
+      ]);
+      const piMap = {};
+      periodItems.forEach(pi => { piMap[normalizeItemName(pi.item)] = pi; });
+      lowStockItems = masters.map(m => {
+        const pi = piMap[normalizeItemName(m.item)] || {};
+        const closing = pi.closingStock ?? ((pi.openingStock || 0) + (pi.purchasedQty || 0) - (pi.usedQty || 0));
+        return { item: m.item, unit: m.unit, threshold: m.threshold, closingStock: closing };
+      }).filter(item => item.closingStock <= item.threshold);
+    }
 
     const unreviewedStaffPurchases = await PurchaseHeader.countDocuments({ source: 'staff', reviewed: false });
 
